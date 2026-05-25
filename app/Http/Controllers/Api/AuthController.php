@@ -16,24 +16,32 @@ class AuthController extends Controller
             'password' => 'required',
         ]);
 
-        $user = User::where('username', $request->username)
-            ->where('is_active', true)
-            ->first();
+        // Ambil user berdasarkan username dulu, jangan filter is_active di sini
+        $user = User::where('username', $request->username)->first();
 
+        // Kalau username tidak ada atau password salah
         if (!$user || !Hash::check($request->password, $user->password)) {
-            return response()->json(['message' => 'Username atau password salah'], 401);
+            return response()->json([
+                'message' => 'User/password salah'
+            ], 401);
         }
 
-        // bikin token Sanctum
+        // Kalau username & password benar, baru cek status aktif
+        if ((int) $user->is_active !== 1) {
+            return response()->json([
+                'message' => 'User tidak aktif'
+            ], 403);
+        }
+
         $token = $user->createToken('api-token')->plainTextToken;
 
         return response()->json([
             'token' => $token,
-            'user'  => [
-                'id'       => $user->id,
+            'user' => [
+                'id' => $user->id,
                 'username' => $user->username,
-                'role'     => $user->role,
-            ],
+                'role' => $user->role,
+            ]
         ]);
     }
 
@@ -46,6 +54,8 @@ class AuthController extends Controller
     {
         $request->user()->tokens()->delete();
 
-        return response()->json(['message' => 'Logged out']);
+        return response()->json([
+            'message' => 'Logged out'
+        ]);
     }
 }

@@ -17,13 +17,25 @@ class DamageReport extends Model
     protected $fillable = [
         'vehicle_id',
         'driver_id',
+
+        // Dipakai UI driver saat submit laporan kerusakan
+        'damage_type',
         'description',
-        'status', // fallback (jika belum ada response teknisi)
+        'image',
+
+        // Fallback status jika belum ada response teknisi
+        'status',
+    ];
+
+    protected $casts = [
+        'created_at' => 'datetime',
+        'updated_at' => 'datetime',
     ];
 
     // Biar computed muncul saat return JSON
     protected $appends = [
         'computed_status',
+        'computed_status_label',
         'responsible_technician_id',
     ];
 
@@ -44,8 +56,13 @@ class DamageReport extends Model
     }
 
     /**
-     * History respons teknisi (kronologis)
-     * FK: technician_responses.damage_id -> damage_reports.id
+     * History respons teknisi.
+     *
+     * FK:
+     * technician_responses.damage_id -> damage_reports.id
+     *
+     * Dipakai UI driver/operator untuk activity logs
+     * dan UI teknisi untuk riwayat pekerjaan.
      */
     public function technicianResponses()
     {
@@ -54,8 +71,9 @@ class DamageReport extends Model
     }
 
     /**
-     * Respons teknisi terakhir
-     * Dipakai untuk status laporan & teknisi penanggung jawab
+     * Respons teknisi terakhir.
+     *
+     * Dipakai untuk menentukan status laporan terbaru.
      */
     public function latestTechnicianResponse()
     {
@@ -65,12 +83,12 @@ class DamageReport extends Model
 
     /*
     |--------------------------------------------------------------------------
-    | FITUR BARU (TERINTEGRASI DENGAN LAPORAN)
+    | FITUR TERINTEGRASI DENGAN LAPORAN
     |--------------------------------------------------------------------------
     */
 
     /**
-     * 1 laporan = 1 booking servis
+     * 1 laporan = 1 booking servis.
      */
     public function booking()
     {
@@ -78,7 +96,7 @@ class DamageReport extends Model
     }
 
     /**
-     * 1 laporan = 1 estimasi biaya (draft/submitted/approved/rejected)
+     * 1 laporan = 1 estimasi biaya.
      */
     public function costEstimate()
     {
@@ -86,7 +104,7 @@ class DamageReport extends Model
     }
 
     /**
-     * 1 laporan = 1 review driver ke teknisi (rating+ulasan)
+     * 1 laporan = 1 review driver ke teknisi.
      */
     public function review()
     {
@@ -95,51 +113,159 @@ class DamageReport extends Model
 
     /*
     |--------------------------------------------------------------------------
-    | HELPERS / ATTRIBUTES
+    | ACCESSORS / COMPUTED ATTRIBUTES
     |--------------------------------------------------------------------------
     */
 
     /**
-     * Status untuk frontend
+     * Status utama untuk frontend.
+     *
      * Prioritas:
-     * 1) latestTechnicianResponse.status
-     * 2) kolom status di damage_reports
-     * default: menunggu
+     * 1. latestTechnicianResponse.status
+     * 2. kolom damage_reports.status
+     * 3. default menunggu
+     *
+     * Nilai backend standar:
+     * - menunggu
+     * - proses
+     * - butuh_followup_admin
+     * - fatal
+     * - selesai
      */
     public function getComputedStatusAttribute(): string
     {
         $latest = $this->relationLoaded('latestTechnicianResponse')
             ? $this->latestTechnicianResponse
-            : null;
+            : $this->latestTechnicianResponse()->first();
 
-        $st = $latest?->status;
-        if (is_string($st) && trim($st) !== '') {
-            return $st;
+        $latestStatus = $latest?->status;
+
+        if (is_string($latestStatus) && trim($latestStatus) !== '') {
+            return $this->normalizeStatus($latestStatus);
         }
 
-        $fallback = $this->status;
-        if (is_string($fallback) && trim($fallback) !== '') {
-            return $fallback;
+        $fallbackStatus = $this->status;
+
+        if (is_string($fallbackStatus) && trim($fallbackStatus) !== '') {
+            return $this->normalizeStatus($fallbackStatus);
         }
 
         return 'menunggu';
     }
 
     /**
-     * Teknisi penanggung jawab (ambil dari response terakhir)
+     * Label status untuk UI Flutter.
+     *
+     * Bisa langsung dipakai frontend kalau ingin lebih konsisten.
+     */
+    public function getComputedStatusLabelAttribute(): string
+    {
+        return $this->statusLabel($this->computed_status);
+    }
+
+    /**
+     * Teknisi penanggung jawab diambil dari response terakhir.
      */
     public function getResponsibleTechnicianIdAttribute(): ?int
     {
         $latest = $this->relationLoaded('latestTechnicianResponse')
             ? $this->latestTechnicianResponse
-            : null;
+            : $this->latestTechnicianResponse()->first();
 
-        $tid = $latest?->technician_id;
-        return $tid ? (int) $tid : null;
+        $technicianId = $latest?->technician_id;
+
+        return $technicianId ? (int) $technicianId : null;
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | HELPERS
+    |--------------------------------------------------------------------------
+    */
+
+    public function isReported(): bool
+    {
+        return $this->computed_status === 'menunggu';
+    }
+
+    public function isInProgress(): bool
+    {
+        return $this->computed_status === 'proses';
+    }
+
+    public function isOnHold(): bool
+    {
+        return $this->computed_status === 'butuh_followup_admin';
+    }
+
+    public function isFatal(): bool
+    {
+        return $this->computed_status === 'fatal';
     }
 
     public function isFinished(): bool
     {
         return $this->computed_status === 'selesai';
+    }
+
+    /**
+     * Normalisasi status dari berbagai sumber:
+     * - Flutter lama
+     * - Flutter sekarang
+     * - backend lama
+     * - backend sekarang
+     */
+    public function normalizeStatus(?string $status): string
+    {
+        if ($status === null || trim($status) === '') {
+            return 'menunggu';
+        }
+
+        $status = strtolower(trim($status));
+        $status = str_replace([' ', '-'], '_', $status);
+
+        return match ($status) {
+            'reported',
+            'waiting',
+            'menunggu' => 'menunggu',
+
+            'ongoing',
+            'in_progress',
+            'progress',
+            'diproses',
+            'proses' => 'proses',
+
+            'on_hold',
+            'waiting_parts',
+            'menunggu_sparepart',
+            'butuh_followup',
+            'butuh_followup_admin' => 'butuh_followup_admin',
+
+            'finished',
+            'completed',
+            'complete',
+            'selesai' => 'selesai',
+
+            'fatal' => 'fatal',
+
+            default => $status,
+        };
+    }
+
+    /**
+     * Label status untuk tampilan UI.
+     */
+    public function statusLabel(?string $status): string
+    {
+        $status = $this->normalizeStatus($status);
+
+        return match ($status) {
+            'menunggu' => 'Reported',
+            'proses' => 'Ongoing',
+            'butuh_followup_admin' => 'On Hold',
+            'fatal' => 'Fatal',
+            'selesai' => 'Finished',
+            default => 'Reported',
+        };
     }
 }

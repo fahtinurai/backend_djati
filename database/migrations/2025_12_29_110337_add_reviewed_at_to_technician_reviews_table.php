@@ -8,15 +8,15 @@ return new class extends Migration
 {
     public function up(): void
     {
-        Schema::table('technician_reviews', function (Blueprint $table) {
-            $table->timestamp('reviewed_at')->nullable();
-        });
+        // Schema::table('technician_reviews', function (Blueprint $table) {
+        //     $table->timestamp('reviewed_at')->nullable();
+        // });
     }
 
     public function down(): void
     {
-        Schema::table('technician_reviews', function (Blueprint $table) {
-            $table->dropColumn('reviewed_at');
-        });
+        // Schema::table('technician_reviews', function (Blueprint $table) {
+        //     $table->dropColumn('reviewed_at');
+        // });
     }
 };

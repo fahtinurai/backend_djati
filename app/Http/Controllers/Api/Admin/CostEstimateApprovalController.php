@@ -34,7 +34,7 @@ class CostEstimateApprovalController extends Controller
         if ($costEstimate->status !== 'submitted') {
             return response()->json(['message' => 'Estimasi harus berstatus submitted.'], 422);
         }
-
+    
         $admin = $request->user();
 
         // pastikan total cost konsisten

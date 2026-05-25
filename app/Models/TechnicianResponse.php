@@ -13,10 +13,21 @@ class TechnicianResponse extends Model
         'technician_id',
         'status',
         'note',
+        'mttr',
+        'mtbf',
+        'ma',
+    ];
+
+    protected $casts = [
+        'mttr' => 'decimal:2',
+        'mtbf' => 'decimal:2',
+        'ma' => 'decimal:2',
+        'created_at' => 'datetime',
+        'updated_at' => 'datetime',
     ];
 
     /**
-     * Relasi ke damage report
+     * Relasi ke damage report.
      */
     public function damageReport()
     {
@@ -24,7 +35,7 @@ class TechnicianResponse extends Model
     }
 
     /**
-     * Relasi ke teknisi
+     * Relasi ke teknisi.
      */
     public function technician()
     {

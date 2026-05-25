@@ -7,8 +7,6 @@ use App\Models\Vehicle;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 
-//Fathian Alfiana Rahman menambahkan VehicleController.php untuk menambahkan data kendaraan
-
 class VehicleController extends Controller
 {
     /**
@@ -16,7 +14,9 @@ class VehicleController extends Controller
      */
     public function index()
     {
-        return response()->json(Vehicle::all());
+        $vehicles = Vehicle::orderBy('created_at', 'desc')->get();
+
+        return response()->json($vehicles);
     }
 
     /**
@@ -25,17 +25,19 @@ class VehicleController extends Controller
     public function store(Request $request)
     {
         $request->validate([
-            'plate_number' => 'required|unique:vehicles',
-            'brand'        => 'nullable|string',
-            'model'        => 'nullable|string',
-            'year'         => 'nullable|integer',
+            'equipment_name' => 'required|string|max:255|unique:vehicles,equipment_name',
+            'plate_number'   => 'required|string|max:255|unique:vehicles,plate_number',
+            'brand'          => 'nullable|string|max:255',
+            'model'          => 'nullable|string|max:255',
+            'year'           => 'nullable|integer',
         ]);
 
         $vehicle = Vehicle::create([
-            'brand'        => $request->brand,
-            'model'        => $request->model,
-            'plate_number' => $request->plate_number,
-            'year'         => $request->year,
+            'equipment_name' => $request->equipment_name,
+            'brand'          => $request->brand,
+            'model'          => $request->model,
+            'plate_number'   => $request->plate_number,
+            'year'           => $request->year,
         ]);
 
         /* ============================
@@ -50,12 +52,13 @@ class VehicleController extends Controller
                     'event'    => 'vehicle.created',
                     'channels' => ['admin'],
                     'data'     => [
-                        'id'           => $vehicle->id,
-                        'brand'        => $vehicle->brand,
-                        'model'        => $vehicle->model,
-                        'plate_number' => $vehicle->plate_number,
-                        'year'         => $vehicle->year,
-                        'created_at'   => $vehicle->created_at,
+                        'id'             => $vehicle->id,
+                        'equipment_name' => $vehicle->equipment_name, // ✅ tambahan
+                        'brand'          => $vehicle->brand,
+                        'model'          => $vehicle->model,
+                        'plate_number'   => $vehicle->plate_number,
+                        'year'           => $vehicle->year,
+                        'created_at'     => $vehicle->created_at,
                     ],
                 ]
             );
@@ -74,11 +77,21 @@ class VehicleController extends Controller
     public function update(Request $request, Vehicle $vehicle)
     {
         $request->validate([
-            'plate_number' => 'sometimes|unique:vehicles,plate_number,' . $vehicle->id,
+            'equipment_name' => 'sometimes|string|max:255|unique:vehicles,equipment_name,' . $vehicle->id,
+            'plate_number'   => 'sometimes|string|max:255|unique:vehicles,plate_number,' . $vehicle->id,
+            'brand'          => 'sometimes|nullable|string|max:255',
+            'model'          => 'sometimes|nullable|string|max:255',
+            'year'           => 'sometimes|nullable|integer',
         ]);
 
         $vehicle->update(
-            $request->only('brand', 'model', 'plate_number', 'year')
+            $request->only([
+                'equipment_name',
+                'brand',
+                'model',
+                'plate_number',
+                'year',
+            ])
         );
 
         return response()->json($vehicle);

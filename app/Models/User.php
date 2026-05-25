@@ -15,6 +15,7 @@ class User extends Authenticatable
      * Fields yang boleh diisi
      */
     protected $fillable = [
+        'name',
         'username',
         'login_key',
         'role',

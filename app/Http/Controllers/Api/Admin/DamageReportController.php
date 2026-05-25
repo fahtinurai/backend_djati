@@ -13,18 +13,97 @@ use App\Services\NodeEventPublisher;
 class DamageReportController extends Controller
 {
     /**
-     * Admin melihat semua laporan kerusakan
+     * Admin melihat semua laporan kerusakan.
+     *
+     * Support query:
+     * - ?status=menunggu
+     * - ?status=proses
+     * - ?status=butuh_followup_admin
+     * - ?status=selesai
+     * - ?status=fatal
+     * - ?search=keyword
+     * - ?limit=5
      */
-    public function index()
+    public function index(Request $request)
     {
-        $reports = DamageReport::with([
+        $q = DamageReport::query()
+            ->with([
                 'vehicle',
                 'driver',
                 'technicianResponses.technician',
                 'latestTechnicianResponse.technician',
             ])
-            ->orderBy('created_at', 'desc')
-            ->get();
+            ->orderBy('created_at', 'desc');
+
+        /*
+        |--------------------------------------------------------------------------
+        | FILTER STATUS
+        |--------------------------------------------------------------------------
+        | Frontend mengirim:
+        | - selesai untuk Completed
+        | - proses untuk In Progress
+        | - butuh_followup_admin untuk Waiting Parts
+        | - menunggu untuk Reported
+        */
+        if ($request->filled('status')) {
+            $status = $this->normalizeStatus($request->query('status'));
+
+            if ($status === 'menunggu') {
+                $q->where(function ($query) {
+                    $query->whereDoesntHave('latestTechnicianResponse')
+                        ->orWhere('status', 'menunggu')
+                        ->orWhereNull('status');
+                });
+            } else {
+                $q->whereHas('latestTechnicianResponse', function ($response) use ($status) {
+                    $response->where('status', $status);
+                });
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | SEARCH
+        |--------------------------------------------------------------------------
+        | Cari berdasarkan:
+        | - nama equipment
+        | - plate number
+        | - username driver
+        | - damage type
+        | - description
+        */
+        if ($request->filled('search')) {
+            $search = trim($request->query('search'));
+
+            $q->where(function ($query) use ($search) {
+                $query->where('damage_type', 'like', "%{$search}%")
+                    ->orWhere('description', 'like', "%{$search}%")
+                    ->orWhereHas('vehicle', function ($vehicle) use ($search) {
+                        $vehicle->where('equipment_name', 'like', "%{$search}%")
+                            ->orWhere('plate_number', 'like', "%{$search}%");
+                    })
+                    ->orWhereHas('driver', function ($driver) use ($search) {
+                        $driver->where('username', 'like', "%{$search}%");
+                    });
+            });
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | LIMIT
+        |--------------------------------------------------------------------------
+        */
+        if ($request->filled('limit')) {
+            $limit = (int) $request->query('limit');
+
+            if ($limit > 0) {
+                $q->limit($limit);
+            }
+        }
+
+        $reports = $q->get();
+
+        $reports = $this->attachRepairHistoryInfo($reports);
 
         return response()->json($reports);
     }
@@ -41,6 +120,16 @@ class DamageReportController extends Controller
             'latestTechnicianResponse.technician',
         ]);
 
+        $repair = Repair::with([
+                'technician',
+                'items.part',
+            ])
+            ->where('damage_report_id', $damageReport->id)
+            ->first();
+
+        $damageReport->setAttribute('repair_history_saved', $repair ? true : false);
+        $damageReport->setAttribute('repair_history', $repair);
+
         return response()->json($damageReport);
     }
 
@@ -53,20 +142,181 @@ class DamageReportController extends Controller
                 'vehicle',
                 'driver',
                 'latestTechnicianResponse.technician',
+                'technicianResponses.technician',
             ])
             ->whereHas('latestTechnicianResponse', function ($q) {
                 $q->where('status', 'butuh_followup_admin');
             })
-            // urutkan berdasarkan response terbaru
             ->orderByDesc(
                 TechnicianResponse::select('created_at')
-                    ->whereColumn('technician_responses.damage_id', 'damage_reports.id') // ✅ FIX: damage_id
+                    ->whereColumn('technician_responses.damage_id', 'damage_reports.id')
                     ->latest()
                     ->take(1)
             )
             ->get();
 
+        $reports = $this->attachRepairHistoryInfo($reports);
+
         return response()->json($reports);
+    }
+
+    /**
+     * Admin melihat semua laporan teknisi yang sudah selesai.
+     *
+     * Ini untuk halaman admin repair history / finished repair.
+     */
+    public function finishedRepairs()
+    {
+        $reports = DamageReport::with([
+                'vehicle',
+                'driver',
+                'technicianResponses.technician',
+                'latestTechnicianResponse.technician',
+                'booking',
+                'review',
+            ])
+            ->whereHas('latestTechnicianResponse', function ($q) {
+                $q->where('status', 'selesai');
+            })
+            ->orderByDesc(
+                TechnicianResponse::select('created_at')
+                    ->whereColumn('technician_responses.damage_id', 'damage_reports.id')
+                    ->latest()
+                    ->take(1)
+            )
+            ->get();
+
+        $reports = $this->attachRepairHistoryInfo($reports);
+
+        return response()->json($reports);
+    }
+
+    /**
+     * Admin menyimpan finished repair history dari hasil teknisi.
+     *
+     * Alur:
+     * - Teknisi update laporan menjadi status selesai.
+     * - Data status selesai tersimpan di technician_responses.
+     * - Admin memanggil endpoint ini untuk menyimpan hasil tersebut ke tabel repairs.
+     * - Repair dibuat finalized=true sebagai history final admin.
+     */
+    public function storeFinishedRepairHistory(Request $request, DamageReport $damageReport)
+    {
+        $request->validate([
+            'admin_note' => 'nullable|string',
+            'action'     => 'nullable|string',
+            'cost'       => 'nullable|numeric|min:0',
+        ]);
+
+        $damageReport->load([
+            'vehicle',
+            'driver',
+            'latestTechnicianResponse.technician',
+            'technicianResponses.technician',
+        ]);
+
+        $latest = $damageReport->latestTechnicianResponse;
+
+        if (!$latest || $latest->status !== 'selesai') {
+            return response()->json([
+                'message' => 'Laporan ini belum selesai dari teknisi.',
+                'debug' => [
+                    'latest_status' => $latest?->status,
+                    'damage_report_status' => $damageReport->status ?? null,
+                ],
+            ], 422);
+        }
+
+        try {
+            $repair = DB::transaction(function () use ($request, $damageReport, $latest) {
+                /*
+                |--------------------------------------------------------------------------
+                | Pastikan fallback status damage_reports juga selesai.
+                |--------------------------------------------------------------------------
+                */
+                $damageReport->update([
+                    'status' => 'selesai',
+                ]);
+
+                /*
+                |--------------------------------------------------------------------------
+                | Simpan / update repair history admin.
+                |--------------------------------------------------------------------------
+                */
+                $repair = Repair::updateOrCreate(
+                    [
+                        'damage_report_id' => $damageReport->id,
+                    ],
+                    [
+                        'vehicle_plate' => optional($damageReport->vehicle)->plate_number ?? 'UNKNOWN',
+                        'technician_id' => $latest->technician_id,
+                        'action'        => $request->action
+                            ?? $latest->note
+                            ?? $request->admin_note
+                            ?? 'Repair selesai oleh teknisi',
+                        'cost'          => $request->cost ?? 0,
+                        'repair_date'   => now()->toDateString(),
+                        'finalized'     => true,
+                        'finalized_at'  => now(),
+                    ]
+                );
+
+                return $repair;
+            });
+        } catch (\Throwable $e) {
+            return response()->json([
+                'message' => 'Gagal menyimpan finished repair history.',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+
+        $repair->load([
+            'damageReport.vehicle',
+            'damageReport.driver',
+            'technician',
+            'items.part',
+        ]);
+
+        $damageReport->refresh();
+        $damageReport->load([
+            'vehicle',
+            'driver',
+            'technicianResponses.technician',
+            'latestTechnicianResponse.technician',
+        ]);
+
+        $damageReport->setAttribute('repair_history_saved', true);
+        $damageReport->setAttribute('repair_history', $repair);
+
+        try {
+            NodeEventPublisher::publish('repair.finished_saved', [
+                'repair_id'        => $repair->id,
+                'damage_report_id' => $damageReport->id,
+                'vehicle_id'       => $damageReport->vehicle_id,
+                'vehicle_plate'    => $repair->vehicle_plate,
+                'equipment_name'   => $damageReport->vehicle?->equipment_name,
+                'driver_id'        => $damageReport->driver_id,
+                'technician_id'    => $repair->technician_id,
+                'status'           => 'selesai',
+                'finalized'        => true,
+                'repair_date'      => optional($repair->repair_date)?->toDateString(),
+                'finalized_at'     => optional($repair->finalized_at)?->toISOString(),
+                'mttr'             => $damageReport->latestTechnicianResponse?->mttr,
+                'mtbf'             => $damageReport->latestTechnicianResponse?->mtbf,
+                'ma'               => $damageReport->latestTechnicianResponse?->ma,
+                'created_at'       => optional($repair->created_at)?->toISOString(),
+                'updated_at'       => optional($repair->updated_at)?->toISOString(),
+            ], ['admin']);
+        } catch (\Throwable $e) {
+            \Log::error('NodeEventPublisher repair.finished_saved error: ' . $e->getMessage());
+        }
+
+        return response()->json([
+            'message' => 'Finished repair history berhasil disimpan ke admin.',
+            'damage_report' => $damageReport,
+            'latest_technician_response' => $damageReport->latestTechnicianResponse,
+            'repair' => $repair,
+        ], 201);
     }
 
     /**
@@ -105,7 +355,7 @@ class DamageReportController extends Controller
 
                 // 2) Audit trail
                 $damageReport->technicianResponses()->create([
-                    'damage_id'      => $damageReport->id, // ✅ FIX: damage_id
+                    'damage_id'      => $damageReport->id,
                     'technician_id'  => null,
                     'status'         => 'approved_followup_admin',
                     'note'           => $request->admin_note ?? 'Approved by admin',
@@ -115,9 +365,9 @@ class DamageReportController extends Controller
                 Repair::firstOrCreate(
                     ['damage_report_id' => $damageReport->id],
                     [
-                        'vehicle_plate' => optional($damageReport->vehicle)->plate_number ?? 'UNKNOWN', // ✅ wajib
+                        'vehicle_plate' => optional($damageReport->vehicle)->plate_number ?? 'UNKNOWN',
                         'finalized'     => false,
-                        'repair_date'   => now()->toDateString(), // ✅ untuk UI tanggal
+                        'repair_date'   => now()->toDateString(),
                         'cost'          => 0,
                     ]
                 );
@@ -162,10 +412,87 @@ class DamageReportController extends Controller
             'latestTechnicianResponse.technician',
         ]);
 
+        $repair = Repair::where('damage_report_id', $damageReport->id)->first();
+
+        $damageReport->setAttribute('repair_history_saved', $repair ? true : false);
+        $damageReport->setAttribute('repair_history', $repair);
+
         return response()->json([
             'message'       => 'Follow-up disetujui & repair draft dibuat',
             'damage_report' => $damageReport,
             'repair'        => $repair,
         ]);
+    }
+
+    /**
+     * Tambahkan informasi repair history ke setiap damage report.
+     *
+     * Ini dipakai frontend untuk:
+     * - menyembunyikan tombol Save to Repair History jika sudah pernah disimpan
+     * - menampilkan status saved
+     */
+    private function attachRepairHistoryInfo($reports)
+    {
+        $ids = $reports->pluck('id')->filter()->values();
+
+        if ($ids->isEmpty()) {
+            return $reports;
+        }
+
+        $repairs = Repair::whereIn('damage_report_id', $ids)
+            ->get()
+            ->keyBy('damage_report_id');
+
+        return $reports->map(function ($report) use ($repairs) {
+            $repair = $repairs->get($report->id);
+
+            $report->setAttribute('repair_history_saved', $repair ? true : false);
+            $report->setAttribute('repair_history', $repair);
+
+            return $report;
+        });
+    }
+
+    /**
+     * Normalisasi status dari frontend ke status backend.
+     */
+    private function normalizeStatus(?string $status): ?string
+    {
+        if ($status === null) {
+            return null;
+        }
+
+        $status = strtolower(trim($status));
+        $status = str_replace([' ', '-'], '_', $status);
+
+        return match ($status) {
+            'reported',
+            'waiting',
+            'menunggu' => 'menunggu',
+
+            'ongoing',
+            'in_progress',
+            'diproses',
+            'proses' => 'proses',
+
+            'on_hold',
+            'waiting_parts',
+            'menunggu_sparepart',
+            'butuh_followup',
+            'butuh_followup_admin' => 'butuh_followup_admin',
+
+            'finished',
+            'completed',
+            'complete',
+            'selesai' => 'selesai',
+
+            'fatal' => 'fatal',
+
+            'approved_followup_admin',
+            'followup_approved',
+            'follow_up_approved' => 'approved_followup_admin',
+
+            default => $status,
+        };
     }
 }

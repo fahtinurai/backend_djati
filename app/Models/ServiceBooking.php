@@ -17,17 +17,27 @@ class ServiceBooking extends Model
         'damage_report_id',
         'driver_id',
         'vehicle_id',
+        'technician_id',
 
         // waktu
-        'preferred_at',          // ← preferensi waktu dari driver
-        'requested_at',          // ← waktu driver mengajukan
-        'scheduled_at',          // ← jadwal final admin
-        'estimated_finish_at',   // ← estimasi selesai
+        'preferred_at',
+        'requested_at',
+        'scheduled_at',
+        'estimated_finish_at',
+        'started_at',
+        'completed_at',
 
         // status & catatan
         'status',
+        'priority',
         'note_driver',
         'note_admin',
+        'note_technician',
+
+        // KPI teknisi
+        'mttr',
+        'mtbf',
+        'ma',
     ];
 
     /**
@@ -37,11 +47,12 @@ class ServiceBooking extends Model
      */
     protected $attributes = [
         'status' => 'requested',
+        'priority' => 'medium',
     ];
 
     /**
      * =========================
-     * Casts (penting untuk sinkron waktu)
+     * Casts
      * =========================
      */
     protected $casts = [
@@ -49,6 +60,12 @@ class ServiceBooking extends Model
         'requested_at'        => 'datetime',
         'scheduled_at'        => 'datetime',
         'estimated_finish_at' => 'datetime',
+        'started_at'          => 'datetime',
+        'completed_at'        => 'datetime',
+
+        'mttr' => 'decimal:2',
+        'mtbf' => 'decimal:2',
+        'ma'   => 'decimal:1',
     ];
 
     /**
@@ -66,25 +83,50 @@ class ServiceBooking extends Model
     }
 
     /**
-     * Shortcut ke driver via damage report
-     * (tanpa perlu kolom driver_id di service_bookings)
+     * Booking milik satu driver
      */
     public function driver()
+    {
+        return $this->belongsTo(User::class, 'driver_id');
+    }
+
+    /**
+     * Booking untuk satu kendaraan
+     */
+    public function vehicle()
+    {
+        return $this->belongsTo(Vehicle::class, 'vehicle_id');
+    }
+
+    /**
+     * Teknisi yang ditugaskan admin untuk booking ini
+     */
+    public function technician()
+    {
+        return $this->belongsTo(User::class, 'technician_id');
+    }
+
+    /**
+     * Driver dari damage report.
+     * Opsional, kalau kamu tetap mau akses driver asli dari laporan.
+     */
+    public function reportDriver()
     {
         return $this->hasOneThrough(
             User::class,
             DamageReport::class,
-            'id',           // PK di damage_reports
-            'id',           // PK di users
-            'damage_report_id', // FK di service_bookings
-            'driver_id'     // FK di damage_reports
+            'id',
+            'id',
+            'damage_report_id',
+            'driver_id'
         );
     }
 
     /**
-     * Shortcut ke vehicle via damage report
+     * Vehicle dari damage report.
+     * Opsional, kalau kamu tetap mau akses kendaraan asli dari laporan.
      */
-    public function vehicle()
+    public function reportVehicle()
     {
         return $this->hasOneThrough(
             Vehicle::class,
@@ -98,31 +140,37 @@ class ServiceBooking extends Model
 
     /**
      * =========================
-     * Helper (opsional tapi sangat berguna)
+     * Helper
      * =========================
      */
 
-    /**
-     * Apakah booking masih tahap pengajuan driver
-     */
     public function isRequested(): bool
     {
         return $this->status === 'requested';
     }
 
-    /**
-     * Apakah booking sudah dijadwalkan admin
-     */
     public function isScheduled(): bool
     {
         return in_array($this->status, ['approved', 'rescheduled'], true);
     }
 
-    /**
-     * Apakah booking sudah dibatalkan
-     */
+    public function isInProgress(): bool
+    {
+        return $this->status === 'in_progress';
+    }
+
+    public function isCompleted(): bool
+    {
+        return $this->status === 'completed';
+    }
+
     public function isCanceled(): bool
     {
-        return $this->status === 'canceled';
+        return in_array($this->status, ['canceled', 'cancelled'], true);
+    }
+
+    public function isClosed(): bool
+    {
+        return in_array($this->status, ['completed', 'canceled', 'cancelled'], true);
     }
 }

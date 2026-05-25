@@ -1,5 +1,5 @@
 <?php
-// Nur Ahmadi Aditya Nanda
+
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
@@ -12,6 +12,10 @@ class VehicleAssignment extends Model
         'vehicle_id',
         'driver_id',
         'assigned_at',
+    ];
+
+    protected $casts = [
+        'assigned_at' => 'datetime',
     ];
 
     public function vehicle()
