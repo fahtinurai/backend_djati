@@ -82,7 +82,15 @@ class ServiceBookingController extends Controller
             ->latest()
             ->first();
 
-        if ($existing && in_array($existing->status, ['approved', 'rescheduled', 'in_progress', 'completed'], true)) {
+        if ($existing && in_array($existing->status, [
+            'approved',
+            'scheduled',
+            'rescheduled',
+            'in_progress',
+            'completed',
+            'finished',
+            'selesai',
+        ], true)) {
             return response()->json([
                 'message' => 'Booking sudah dijadwalkan admin, tidak bisa mengajukan ulang. Silakan hubungi admin jika perlu ubah jadwal.',
                 'data' => $existing->load([
@@ -95,9 +103,19 @@ class ServiceBookingController extends Controller
             ], 422);
         }
 
-        $booking = $existing ?: new ServiceBooking();
-
-        if (!$booking->exists) {
+        /*
+        |--------------------------------------------------------------------------
+        | Penting:
+        |--------------------------------------------------------------------------
+        | Kalau booking sebelumnya canceled, JANGAN dipakai ulang.
+        | Buat row booking baru supaya tidak membawa technician_id / jadwal lama.
+        |
+        | Kalau booking terakhir masih requested, cukup update booking itu.
+        */
+        if ($existing && $existing->status === 'requested') {
+            $booking = $existing;
+        } else {
+            $booking = new ServiceBooking();
             $booking->damage_report_id = $damageReport->id;
             $booking->requested_at = now();
         }
@@ -106,23 +124,25 @@ class ServiceBookingController extends Controller
         $booking->vehicle_id = $damageReport->vehicle_id;
         $booking->preferred_at = $request->preferred_at;
         $booking->status = 'requested';
-
-        if (!$booking->priority) {
-            $booking->priority = 'medium';
-        }
+        $booking->priority = $booking->priority ?: 'medium';
 
         $booking->note_driver = $request->note_driver
             ?? ($request->preferred_at ? ('Preferensi jadwal: ' . $request->preferred_at) : null);
 
-        if ($existing && $existing->status === 'canceled') {
-            $booking->scheduled_at = null;
-            $booking->estimated_finish_at = null;
-            $booking->technician_id = null;
-            $booking->note_admin = null;
-            $booking->started_at = null;
-            $booking->completed_at = null;
-            $booking->note_technician = null;
-        }
+        /*
+        |--------------------------------------------------------------------------
+        | Reset total saat driver mengajukan booking.
+        |--------------------------------------------------------------------------
+        | Driver hanya boleh membuat booking requested.
+        | Teknisi dan jadwal hanya boleh diisi oleh admin saat approve.
+        */
+        $booking->technician_id = null;
+        $booking->scheduled_at = null;
+        $booking->estimated_finish_at = null;
+        $booking->note_admin = null;
+        $booking->started_at = null;
+        $booking->completed_at = null;
+        $booking->note_technician = null;
 
         $booking->save();
 
@@ -140,8 +160,6 @@ class ServiceBookingController extends Controller
         |--------------------------------------------------------------------------
         | FCM ke admin
         |--------------------------------------------------------------------------
-        | FCM dipanggil lazy di dalam try supaya FIREBASE_CREDENTIALS yang belum
-        | diset tidak menggagalkan proses booking.
         */
         try {
             $fcm = app(\App\Services\FcmService::class);
@@ -190,9 +208,10 @@ class ServiceBookingController extends Controller
                     ?? $damageReport?->vehicle?->plate_number,
                 'status'           => (string) $booking->status,
                 'priority'         => (string) ($booking->priority ?? 'medium'),
+                'technician_id'    => null,
                 'preferred_at'     => optional($booking->preferred_at)->toISOString(),
-                'scheduled_at'     => optional($booking->scheduled_at)->toISOString(),
-                'estimated_finish_at' => optional($booking->estimated_finish_at)->toISOString(),
+                'scheduled_at'     => null,
+                'estimated_finish_at' => null,
                 'requested_at'     => optional($booking->requested_at)->toISOString(),
                 'created_at'       => optional($booking->created_at)->toISOString(),
                 'updated_at'       => optional($booking->updated_at)->toISOString(),
@@ -286,14 +305,28 @@ class ServiceBookingController extends Controller
             ], 403);
         }
 
-        if (!in_array($booking->status, ['requested', 'approved', 'rescheduled'], true)) {
+        if (!in_array($booking->status, ['requested', 'approved', 'scheduled', 'rescheduled'], true)) {
             return response()->json([
                 'message' => 'Booking tidak bisa dibatalkan.',
             ], 422);
         }
 
+        /*
+        |--------------------------------------------------------------------------
+        | Penting:
+        |--------------------------------------------------------------------------
+        | Saat cancel, technician_id dan jadwal harus dibersihkan.
+        | Supaya booking canceled tidak tetap muncul di halaman teknisi.
+        */
         $booking->update([
             'status' => 'canceled',
+            'technician_id' => null,
+            'scheduled_at' => null,
+            'estimated_finish_at' => null,
+            'note_admin' => null,
+            'started_at' => null,
+            'completed_at' => null,
+            'note_technician' => null,
         ]);
 
         $booking->refresh();
@@ -356,9 +389,10 @@ class ServiceBookingController extends Controller
                     ?? $report?->vehicle?->plate_number,
                 'status'           => (string) $booking->status,
                 'priority'         => (string) ($booking->priority ?? 'medium'),
+                'technician_id'    => null,
                 'preferred_at'     => optional($booking->preferred_at)->toISOString(),
-                'scheduled_at'     => optional($booking->scheduled_at)->toISOString(),
-                'estimated_finish_at' => optional($booking->estimated_finish_at)->toISOString(),
+                'scheduled_at'     => null,
+                'estimated_finish_at' => null,
                 'requested_at'     => optional($booking->requested_at)->toISOString(),
                 'created_at'       => optional($booking->created_at)->toISOString(),
                 'updated_at'       => optional($booking->updated_at)->toISOString(),

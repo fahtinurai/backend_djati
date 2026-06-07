@@ -63,7 +63,6 @@ class RepairController extends Controller
             return response()->json(['message' => 'Damage report tidak ditemukan.'], 422);
         }
 
-        // ✅ KUNCI: cukup cek damage_reports.status
         if (($dr->status ?? '') !== 'approved_followup_admin') {
             return response()->json([
                 'message' => 'Repair hanya bisa difinalisasi setelah follow-up disetujui admin.',

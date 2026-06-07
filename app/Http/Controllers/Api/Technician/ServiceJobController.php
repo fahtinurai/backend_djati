@@ -13,9 +13,13 @@ class ServiceJobController extends Controller
 {
     /**
      * List job untuk teknisi:
-     * - queue  : approved, rescheduled
-     * - active : approved, rescheduled, in_progress
-     * - all    : semua
+     * - queue  : approved, scheduled, rescheduled
+     * - active : approved, scheduled, rescheduled, in_progress
+     * - all    : semua job milik teknisi, kecuali requested/canceled/rejected
+     *
+     * PENTING:
+     * Teknisi hanya boleh melihat job yang sudah dipilih admin.
+     * Jadi technician_id wajib sama dengan teknisi login.
      */
     public function index(Request $request)
     {
@@ -29,34 +33,47 @@ class ServiceJobController extends Controller
                 'driver',
                 'technician',
             ])
+            ->where('technician_id', $technician->id)
+            ->whereNotIn('status', [
+                'requested',
+                'pending',
+                'reported',
+                'menunggu',
+                'canceled',
+                'cancelled',
+                'dibatalkan',
+                'rejected',
+                'ditolak',
+            ])
             ->orderByRaw("CASE status
                 WHEN 'in_progress' THEN 0
                 WHEN 'approved' THEN 1
-                WHEN 'rescheduled' THEN 2
+                WHEN 'scheduled' THEN 2
+                WHEN 'rescheduled' THEN 3
+                WHEN 'completed' THEN 4
                 ELSE 9 END")
             ->orderBy('scheduled_at', 'asc')
             ->latest('updated_at');
 
-        /*
-        |--------------------------------------------------------------------------
-        | Optional filter teknisi
-        |--------------------------------------------------------------------------
-        | Kalau kolom technician_id sudah ada dan admin mengirim technician_id,
-        | teknisi hanya melihat job miliknya.
-        |
-        | Kalau kamu ingin semua teknisi bisa melihat semua job, hapus blok ini.
-        */
-        if ($this->hasColumnOnTable('service_bookings', 'technician_id')) {
-            $q->where(function ($query) use ($technician) {
-                $query->whereNull('technician_id')
-                    ->orWhere('technician_id', $technician->id);
-            });
-        }
-
         if ($status === 'queue') {
-            $q->whereIn('status', ['approved', 'rescheduled']);
+            $q->whereIn('status', [
+                'approved',
+                'scheduled',
+                'rescheduled',
+            ]);
         } elseif ($status === 'active') {
-            $q->whereIn('status', ['approved', 'rescheduled', 'in_progress']);
+            $q->whereIn('status', [
+                'approved',
+                'scheduled',
+                'rescheduled',
+                'in_progress',
+            ]);
+        } elseif ($status === 'completed') {
+            $q->whereIn('status', [
+                'completed',
+                'finished',
+                'selesai',
+            ]);
         } elseif ($status !== 'all') {
             $q->where('status', $status);
         }
@@ -82,12 +99,8 @@ class ServiceJobController extends Controller
     /**
      * Teknisi mulai kerja.
      *
-     * otomatis:
-     * - status -> in_progress
-     * - started_at -> now()
-     * - technician_id -> teknisi login jika belum ada
-     * - note_technician opsional
-     * - notif driver tidak memblokir proses
+     * Teknisi tidak boleh mengambil job sendiri.
+     * technician_id harus sudah diisi admin saat approve.
      */
     public function start(Request $request, ServiceBooking $booking)
     {
@@ -105,7 +118,7 @@ class ServiceJobController extends Controller
             'technician',
         ]);
 
-        if (!in_array($booking->status, ['approved', 'rescheduled'], true)) {
+        if (!in_array($booking->status, ['approved', 'scheduled', 'rescheduled'], true)) {
             return response()->json([
                 'message' => 'Job tidak bisa dimulai.',
             ], 422);
@@ -117,10 +130,6 @@ class ServiceJobController extends Controller
 
         if ($this->hasColumn($booking, 'started_at')) {
             $payload['started_at'] = now();
-        }
-
-        if ($this->hasColumn($booking, 'technician_id') && empty($booking->technician_id)) {
-            $payload['technician_id'] = $request->user()->id;
         }
 
         if ($this->hasColumn($booking, 'note_technician') && $request->filled('note_technician')) {
@@ -143,13 +152,6 @@ class ServiceJobController extends Controller
 
         $updatedIso = optional($booking->updated_at)->toISOString();
 
-        /*
-        |--------------------------------------------------------------------------
-        | FCM ke driver
-        |--------------------------------------------------------------------------
-        | Dipanggil lazy agar FIREBASE_CREDENTIALS yang belum diset tidak
-        | menggagalkan start job.
-        */
         try {
             $fcm = app(\App\Services\FcmService::class);
 
@@ -181,11 +183,6 @@ class ServiceJobController extends Controller
             ]);
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Node event
-        |--------------------------------------------------------------------------
-        */
         try {
             NodeEventPublisher::publish('service_job.started', [
                 'booking_id' => (int) $booking->id,
@@ -212,14 +209,6 @@ class ServiceJobController extends Controller
 
     /**
      * Teknisi selesai kerja.
-     *
-     * otomatis:
-     * - status -> completed
-     * - completed_at -> now()
-     * - note_technician opsional
-     * - mttr / mtbf / ma opsional
-     * - damage_reports.status -> selesai jika kolom ada
-     * - notif driver tidak memblokir proses
      */
     public function complete(Request $request, ServiceBooking $booking)
     {
@@ -254,10 +243,6 @@ class ServiceJobController extends Controller
             $payload['completed_at'] = now();
         }
 
-        if ($this->hasColumn($booking, 'technician_id') && empty($booking->technician_id)) {
-            $payload['technician_id'] = $request->user()->id;
-        }
-
         if ($this->hasColumn($booking, 'note_technician') && $request->filled('note_technician')) {
             $payload['note_technician'] = $request->note_technician;
         }
@@ -290,11 +275,6 @@ class ServiceJobController extends Controller
 
         $updatedIso = optional($booking->updated_at)->toISOString();
 
-        /*
-        |--------------------------------------------------------------------------
-        | Sinkron status damage report
-        |--------------------------------------------------------------------------
-        */
         try {
             $report = $booking->damageReport;
 
@@ -311,11 +291,6 @@ class ServiceJobController extends Controller
             ]);
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | FCM ke driver
-        |--------------------------------------------------------------------------
-        */
         try {
             $fcm = app(\App\Services\FcmService::class);
 
@@ -347,11 +322,6 @@ class ServiceJobController extends Controller
             ]);
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Node event
-        |--------------------------------------------------------------------------
-        */
         try {
             NodeEventPublisher::publish('service_job.completed', [
                 'booking_id' => (int) $booking->id,
@@ -381,20 +351,43 @@ class ServiceJobController extends Controller
 
     /**
      * Helper: validasi akses teknisi ke booking.
+     *
+     * PENTING:
+     * Kalau technician_id kosong, teknisi tidak boleh akses.
      */
     private function authorizeTechnicianAccess(Request $request, ServiceBooking $booking): void
     {
         if (!$this->hasColumnOnTable('service_bookings', 'technician_id')) {
-            return;
+            abort(response()->json([
+                'message' => 'Kolom technician_id belum tersedia pada service_bookings.',
+            ], 500));
         }
 
         if (!$booking->technician_id) {
-            return;
+            abort(response()->json([
+                'message' => 'Job ini belum ditugaskan admin ke teknisi.',
+            ], 403));
         }
 
         if ((int) $booking->technician_id !== (int) $request->user()->id) {
             abort(response()->json([
                 'message' => 'Forbidden. Job ini bukan milik teknisi yang login.',
+            ], 403));
+        }
+
+        if (in_array($booking->status, [
+            'requested',
+            'pending',
+            'reported',
+            'menunggu',
+            'canceled',
+            'cancelled',
+            'dibatalkan',
+            'rejected',
+            'ditolak',
+        ], true)) {
+            abort(response()->json([
+                'message' => 'Job ini belum aktif untuk teknisi.',
             ], 403));
         }
     }

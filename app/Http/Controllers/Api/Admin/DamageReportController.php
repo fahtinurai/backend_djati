@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api\Admin;
 use App\Http\Controllers\Controller;
 use App\Models\DamageReport;
 use App\Models\Repair;
+use App\Models\ServiceBooking;
 use App\Models\TechnicianResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -32,6 +33,7 @@ class DamageReportController extends Controller
                 'driver',
                 'technicianResponses.technician',
                 'latestTechnicianResponse.technician',
+                'booking',
             ])
             ->orderBy('created_at', 'desc');
 
@@ -53,6 +55,29 @@ class DamageReportController extends Controller
                     $query->whereDoesntHave('latestTechnicianResponse')
                         ->orWhere('status', 'menunggu')
                         ->orWhereNull('status');
+                });
+            } elseif ($status === 'selesai') {
+                /*
+                |--------------------------------------------------------------------------
+                | SUPPORT FLOW LAMA + FLOW BARU
+                |--------------------------------------------------------------------------
+                | Flow lama:
+                | - technician_responses.status = selesai
+                |
+                | Flow baru maintenance scheduling:
+                | - service_bookings.status = completed / finished / selesai
+                */
+                $q->where(function ($query) {
+                    $query->whereHas('latestTechnicianResponse', function ($response) {
+                        $response->where('status', 'selesai');
+                    })
+                    ->orWhereHas('booking', function ($booking) {
+                        $booking->whereIn('status', [
+                            'completed',
+                            'finished',
+                            'selesai',
+                        ]);
+                    });
                 });
             } else {
                 $q->whereHas('latestTechnicianResponse', function ($response) use ($status) {
@@ -118,6 +143,7 @@ class DamageReportController extends Controller
             'driver',
             'technicianResponses.technician',
             'latestTechnicianResponse.technician',
+            'booking',
         ]);
 
         $repair = Repair::with([
@@ -175,8 +201,27 @@ class DamageReportController extends Controller
                 'booking',
                 'review',
             ])
-            ->whereHas('latestTechnicianResponse', function ($q) {
-                $q->where('status', 'selesai');
+            ->where(function ($query) {
+                /*
+                |--------------------------------------------------------------------------
+                | SUPPORT FLOW LAMA + FLOW BARU
+                |--------------------------------------------------------------------------
+                | Flow lama:
+                | - technician_responses.status = selesai
+                |
+                | Flow baru:
+                | - service_bookings.status = completed / finished / selesai
+                */
+                $query->whereHas('latestTechnicianResponse', function ($q) {
+                    $q->where('status', 'selesai');
+                })
+                ->orWhereHas('booking', function ($booking) {
+                    $booking->whereIn('status', [
+                        'completed',
+                        'finished',
+                        'selesai',
+                    ]);
+                });
             })
             ->orderByDesc(
                 TechnicianResponse::select('created_at')
@@ -184,6 +229,7 @@ class DamageReportController extends Controller
                     ->latest()
                     ->take(1)
             )
+            ->orderByDesc('updated_at')
             ->get();
 
         $reports = $this->attachRepairHistoryInfo($reports);
@@ -213,22 +259,72 @@ class DamageReportController extends Controller
             'driver',
             'latestTechnicianResponse.technician',
             'technicianResponses.technician',
+            'booking',
         ]);
 
         $latest = $damageReport->latestTechnicianResponse;
 
-        if (!$latest || $latest->status !== 'selesai') {
+        /*
+        |--------------------------------------------------------------------------
+        | SUPPORT FLOW BARU SERVICE BOOKING
+        |--------------------------------------------------------------------------
+        | Jika teknisi menyelesaikan pekerjaan dari halaman maintenance scheduling,
+        | status selesai tersimpan di service_bookings.status = completed.
+        */
+        $completedBooking = $this->getCompletedServiceBooking($damageReport);
+
+        $isFinishedFromOldFlow =
+            $latest &&
+            $latest->status === 'selesai';
+
+        $isFinishedFromServiceBooking =
+            $completedBooking &&
+            in_array($completedBooking->status, [
+                'completed',
+                'finished',
+                'selesai',
+            ], true);
+
+        if (!$isFinishedFromOldFlow && !$isFinishedFromServiceBooking) {
             return response()->json([
                 'message' => 'Laporan ini belum selesai dari teknisi.',
                 'debug' => [
                     'latest_status' => $latest?->status,
                     'damage_report_status' => $damageReport->status ?? null,
+                    'service_booking_status' => $completedBooking?->status,
+                    'service_booking_id' => $completedBooking?->id,
                 ],
             ], 422);
         }
 
         try {
-            $repair = DB::transaction(function () use ($request, $damageReport, $latest) {
+            $repair = DB::transaction(function () use (
+                $request,
+                $damageReport,
+                &$latest,
+                $completedBooking,
+                $isFinishedFromOldFlow
+            ) {
+                /*
+                |--------------------------------------------------------------------------
+                | Jika flow baru sudah completed tapi technician_response belum ada,
+                | buat bridge/audit response supaya flow lama tetap kompatibel.
+                |--------------------------------------------------------------------------
+                */
+                if (!$isFinishedFromOldFlow && $completedBooking) {
+                    $latest = $damageReport->technicianResponses()->create([
+                        'damage_id'     => $damageReport->id,
+                        'technician_id' => $completedBooking->technician_id,
+                        'status'        => 'selesai',
+                        'note'          => $completedBooking->note_technician
+                            ?? $completedBooking->note_admin
+                            ?? 'Repair selesai oleh teknisi',
+                        'mttr'          => $completedBooking->mttr ?? null,
+                        'mtbf'          => $completedBooking->mtbf ?? null,
+                        'ma'            => $completedBooking->ma ?? null,
+                    ]);
+                }
+
                 /*
                 |--------------------------------------------------------------------------
                 | Pastikan fallback status damage_reports juga selesai.
@@ -237,6 +333,23 @@ class DamageReportController extends Controller
                 $damageReport->update([
                     'status' => 'selesai',
                 ]);
+
+                /*
+                |--------------------------------------------------------------------------
+                | Tentukan data teknisi dan action dari flow lama / flow baru.
+                |--------------------------------------------------------------------------
+                */
+                $technicianId =
+                    $latest?->technician_id ??
+                    $completedBooking?->technician_id;
+
+                $action =
+                    $request->action
+                    ?? $latest?->note
+                    ?? $completedBooking?->note_technician
+                    ?? $completedBooking?->note_admin
+                    ?? $request->admin_note
+                    ?? 'Repair selesai oleh teknisi';
 
                 /*
                 |--------------------------------------------------------------------------
@@ -249,11 +362,8 @@ class DamageReportController extends Controller
                     ],
                     [
                         'vehicle_plate' => optional($damageReport->vehicle)->plate_number ?? 'UNKNOWN',
-                        'technician_id' => $latest->technician_id,
-                        'action'        => $request->action
-                            ?? $latest->note
-                            ?? $request->admin_note
-                            ?? 'Repair selesai oleh teknisi',
+                        'technician_id' => $technicianId,
+                        'action'        => $action,
                         'cost'          => $request->cost ?? 0,
                         'repair_date'   => now()->toDateString(),
                         'finalized'     => true,
@@ -283,10 +393,13 @@ class DamageReportController extends Controller
             'driver',
             'technicianResponses.technician',
             'latestTechnicianResponse.technician',
+            'booking',
         ]);
 
         $damageReport->setAttribute('repair_history_saved', true);
         $damageReport->setAttribute('repair_history', $repair);
+
+        $completedBooking = $this->getCompletedServiceBooking($damageReport);
 
         try {
             NodeEventPublisher::publish('repair.finished_saved', [
@@ -301,9 +414,12 @@ class DamageReportController extends Controller
                 'finalized'        => true,
                 'repair_date'      => optional($repair->repair_date)?->toDateString(),
                 'finalized_at'     => optional($repair->finalized_at)?->toISOString(),
-                'mttr'             => $damageReport->latestTechnicianResponse?->mttr,
-                'mtbf'             => $damageReport->latestTechnicianResponse?->mtbf,
-                'ma'               => $damageReport->latestTechnicianResponse?->ma,
+                'mttr'             => $damageReport->latestTechnicianResponse?->mttr
+                    ?? $completedBooking?->mttr,
+                'mtbf'             => $damageReport->latestTechnicianResponse?->mtbf
+                    ?? $completedBooking?->mtbf,
+                'ma'               => $damageReport->latestTechnicianResponse?->ma
+                    ?? $completedBooking?->ma,
                 'created_at'       => optional($repair->created_at)?->toISOString(),
                 'updated_at'       => optional($repair->updated_at)?->toISOString(),
             ], ['admin']);
@@ -315,6 +431,7 @@ class DamageReportController extends Controller
             'message' => 'Finished repair history berhasil disimpan ke admin.',
             'damage_report' => $damageReport,
             'latest_technician_response' => $damageReport->latestTechnicianResponse,
+            'completed_service_booking' => $completedBooking,
             'repair' => $repair,
         ], 201);
     }
@@ -451,6 +568,25 @@ class DamageReportController extends Controller
 
             return $report;
         });
+    }
+
+    /**
+     * Ambil service booking yang sudah selesai untuk flow maintenance scheduling baru.
+     */
+    private function getCompletedServiceBooking(DamageReport $damageReport)
+    {
+        return ServiceBooking::with([
+                'technician',
+            ])
+            ->where('damage_report_id', $damageReport->id)
+            ->whereIn('status', [
+                'completed',
+                'finished',
+                'selesai',
+            ])
+            ->latest('completed_at')
+            ->latest('updated_at')
+            ->first();
     }
 
     /**

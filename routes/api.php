@@ -19,8 +19,6 @@ use App\Http\Controllers\Api\Admin\FinanceTransactionController;
 use App\Http\Controllers\Api\Admin\PartUsageApprovalController;
 use App\Http\Controllers\Api\Admin\DamageReportController as AdminDamageReportController;
 use App\Http\Controllers\Api\Admin\ServiceBookingApprovalController as AdminBookingApprovalController;
-use App\Http\Controllers\Api\Admin\CostEstimateApprovalController as AdminCostEstimateApprovalController;
-
 /*
 |--------------------------------------------------------------------------
 | DRIVER CONTROLLERS
@@ -29,7 +27,6 @@ use App\Http\Controllers\Api\Admin\CostEstimateApprovalController as AdminCostEs
 use App\Http\Controllers\Api\Driver\DamageReportController as DriverDamageReportController;
 use App\Http\Controllers\Api\Driver\ServiceBookingController as DriverServiceBookingController;
 use App\Http\Controllers\Api\Driver\ServiceReminderController as DriverServiceReminderController;
-use App\Http\Controllers\Api\Driver\CostEstimateController as DriverCostEstimateController;
 use App\Http\Controllers\Api\Driver\TechnicianReviewController as DriverTechnicianReviewController;
 use App\Http\Controllers\Api\Driver\VehicleDailyLogController as DriverVehicleDailyLogController;
 
@@ -40,7 +37,6 @@ use App\Http\Controllers\Api\Driver\VehicleDailyLogController as DriverVehicleDa
 */
 use App\Http\Controllers\Api\Technician\DamageReportController as TechnicianDamageReportController;
 use App\Http\Controllers\Api\Technician\PartUsageController as TechnicianPartUsageController;
-use App\Http\Controllers\Api\Technician\CostEstimateController as TechnicianCostEstimateController;
 use App\Http\Controllers\Api\Technician\ServiceJobController;
 use App\Http\Controllers\Api\Technician\TechnicianReviewController as TechnicianReviewController;
 
@@ -177,24 +173,21 @@ Route::middleware('auth:sanctum')->group(function () {
         | Digunakan oleh React Admin MaintenanceScheduling:
         | GET  /api/admin/bookings?status=requested
         | GET  /api/admin/bookings?status=all
+        | GET  /api/admin/technicians
         | POST /api/admin/bookings/{booking}/approve
         | POST /api/admin/bookings/{booking}/reschedule
         | POST /api/admin/bookings/{booking}/cancel
         |
         */
         Route::get('bookings', [AdminBookingApprovalController::class, 'index']);
+
+        // Digunakan dropdown mechanic / technician di React Admin
+        Route::get('technicians', [AdminBookingApprovalController::class, 'technicians']);
+
         Route::post('bookings/{booking}/approve', [AdminBookingApprovalController::class, 'approve']);
         Route::post('bookings/{booking}/reschedule', [AdminBookingApprovalController::class, 'reschedule']);
         Route::post('bookings/{booking}/cancel', [AdminBookingApprovalController::class, 'cancel']);
 
-        /*
-        |--------------------------------------------------------------------------
-        | COST ESTIMATE APPROVAL
-        |--------------------------------------------------------------------------
-        */
-        Route::get('cost-estimates', [AdminCostEstimateApprovalController::class, 'index']);
-        Route::post('cost-estimates/{costEstimate}/approve', [AdminCostEstimateApprovalController::class, 'approve']);
-        Route::post('cost-estimates/{costEstimate}/reject', [AdminCostEstimateApprovalController::class, 'reject']);
     });
 
     /*
@@ -259,13 +252,6 @@ Route::middleware('auth:sanctum')->group(function () {
         |--------------------------------------------------------------------------
         */
         Route::put('vehicles/{vehicle}/service-reminder', [DriverServiceReminderController::class, 'update']);
-
-        /*
-        |--------------------------------------------------------------------------
-        | DRIVER COST ESTIMATE
-        |--------------------------------------------------------------------------
-        */
-        Route::get('damage-reports/{damageReport}/cost-estimate', [DriverCostEstimateController::class, 'show']);
 
         /*
         |--------------------------------------------------------------------------
@@ -339,18 +325,15 @@ Route::middleware('auth:sanctum')->group(function () {
         |--------------------------------------------------------------------------
         | SPAREPART USAGE
         |--------------------------------------------------------------------------
+        |
+        | GET  /api/technician/parts?search=...
+        | POST /api/technician/part-usages
+        | GET  /api/technician/my-part-usages
+        |
         */
+        Route::get('parts', [TechnicianPartUsageController::class, 'parts']);
         Route::post('part-usages', [TechnicianPartUsageController::class, 'store']);
         Route::get('my-part-usages', [TechnicianPartUsageController::class, 'myUsages']);
-
-        /*
-        |--------------------------------------------------------------------------
-        | COST ESTIMATE
-        |--------------------------------------------------------------------------
-        */
-        Route::post('damage-reports/{damageReport}/cost-estimate', [TechnicianCostEstimateController::class, 'store']);
-        Route::put('cost-estimates/{costEstimate}', [TechnicianCostEstimateController::class, 'update']);
-        Route::post('cost-estimates/{costEstimate}/submit', [TechnicianCostEstimateController::class, 'submit']);
 
         /*
         |--------------------------------------------------------------------------

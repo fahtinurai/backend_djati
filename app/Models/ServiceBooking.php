@@ -3,23 +3,25 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use App\Models\DamageReport;
+use App\Models\User;
+use App\Models\Vehicle;
 
 class ServiceBooking extends Model
 {
     protected $table = 'service_bookings';
 
-    /**
-     * =========================
-     * Mass assignment
-     * =========================
-     */
+    /*
+    |----------------------------------------------------------------------
+    | MASS ASSIGNMENT
+    |----------------------------------------------------------------------
+    */
     protected $fillable = [
         'damage_report_id',
         'driver_id',
         'vehicle_id',
         'technician_id',
 
-        // waktu
         'preferred_at',
         'requested_at',
         'scheduled_at',
@@ -27,34 +29,33 @@ class ServiceBooking extends Model
         'started_at',
         'completed_at',
 
-        // status & catatan
         'status',
         'priority',
+
         'note_driver',
         'note_admin',
         'note_technician',
 
-        // KPI teknisi
         'mttr',
         'mtbf',
         'ma',
     ];
 
-    /**
-     * =========================
-     * Default values
-     * =========================
-     */
+    /*
+    |----------------------------------------------------------------------
+    | DEFAULT ATTRIBUTES
+    |----------------------------------------------------------------------
+    */
     protected $attributes = [
         'status' => 'requested',
         'priority' => 'medium',
     ];
 
-    /**
-     * =========================
-     * Casts
-     * =========================
-     */
+    /*
+    |----------------------------------------------------------------------
+    | CASTS
+    |----------------------------------------------------------------------
+    */
     protected $casts = [
         'preferred_at'        => 'datetime',
         'requested_at'        => 'datetime',
@@ -68,90 +69,73 @@ class ServiceBooking extends Model
         'ma'   => 'decimal:1',
     ];
 
-    /**
-     * =========================
-     * Relations
-     * =========================
-     */
+    /*
+    |----------------------------------------------------------------------
+    | RELATIONS
+    |----------------------------------------------------------------------
+    */
 
-    /**
-     * Booking milik satu damage report
-     */
     public function damageReport()
     {
         return $this->belongsTo(DamageReport::class, 'damage_report_id');
     }
 
-    /**
-     * Booking milik satu driver
-     */
     public function driver()
     {
         return $this->belongsTo(User::class, 'driver_id');
     }
 
-    /**
-     * Booking untuk satu kendaraan
-     */
     public function vehicle()
     {
         return $this->belongsTo(Vehicle::class, 'vehicle_id');
     }
 
-    /**
-     * Teknisi yang ditugaskan admin untuk booking ini
-     */
     public function technician()
     {
         return $this->belongsTo(User::class, 'technician_id');
     }
 
+    /*
+    |----------------------------------------------------------------------
+    | SAFE ACCESSORS (FIX UTAMA)
+    |----------------------------------------------------------------------
+    */
+
     /**
-     * Driver dari damage report.
-     * Opsional, kalau kamu tetap mau akses driver asli dari laporan.
+     * Driver dari damage report (SAFE VERSION)
      */
-    public function reportDriver()
+    public function getReportDriverAttribute()
     {
-        return $this->hasOneThrough(
-            User::class,
-            DamageReport::class,
-            'id',
-            'id',
-            'damage_report_id',
-            'driver_id'
-        );
+        return $this->damageReport?->driver;
     }
 
     /**
-     * Vehicle dari damage report.
-     * Opsional, kalau kamu tetap mau akses kendaraan asli dari laporan.
+     * Vehicle dari damage report (SAFE VERSION)
      */
-    public function reportVehicle()
+    public function getReportVehicleAttribute()
     {
-        return $this->hasOneThrough(
-            Vehicle::class,
-            DamageReport::class,
-            'id',
-            'id',
-            'damage_report_id',
-            'vehicle_id'
-        );
+        return $this->damageReport?->vehicle;
     }
 
-    /**
-     * =========================
-     * Helper
-     * =========================
-     */
+    /*
+    |----------------------------------------------------------------------
+    | HELPERS STATUS FLOW (TIDAK DIUBAH LOGIKA)
+    |----------------------------------------------------------------------
+    */
 
     public function isRequested(): bool
     {
         return $this->status === 'requested';
     }
 
-    public function isScheduled(): bool
+    public function isApproved(): bool
     {
-        return in_array($this->status, ['approved', 'rescheduled'], true);
+        return $this->status === 'approved';
+    }
+
+    public function isRescheduled(): bool
+    {
+        return $this->status === 'rescheduled';
     }
 
     public function isInProgress(): bool
@@ -169,8 +153,67 @@ class ServiceBooking extends Model
         return in_array($this->status, ['canceled', 'cancelled'], true);
     }
 
+    /*
+    |----------------------------------------------------------------------
+    | BUSINESS FLOW HELPERS (TAMBAHAN AMAN)
+    |----------------------------------------------------------------------
+    */
+
+    /**
+     * Status aktif untuk dashboard teknisi/admin
+     */
+    public function isActive(): bool
+    {
+        return in_array($this->status, [
+            'approved',
+            'rescheduled',
+            'in_progress'
+        ], true);
+    }
+
+    /**
+     * Apakah booking bisa di-assign ulang
+     */
+    public function isAssignable(): bool
+    {
+        return in_array($this->status, [
+            'requested',
+            'approved',
+            'rescheduled'
+        ], true);
+    }
+
+    /**
+     * Apakah job sudah selesai lifecycle
+     */
     public function isClosed(): bool
     {
-        return in_array($this->status, ['completed', 'canceled', 'cancelled'], true);
+        return in_array($this->status, [
+            'completed',
+            'canceled',
+            'cancelled'
+        ], true);
+    }
+
+    /*
+    |----------------------------------------------------------------------
+    | SCHEDULING HELPER (INI PENTING BUAT DROPDOWN NANTI)
+    |----------------------------------------------------------------------
+    */
+
+    /**
+     * Apakah booking punya jadwal valid
+     */
+    public function hasSchedule(): bool
+    {
+        return !is_null($this->scheduled_at);
+    }
+
+    /**
+     * Apakah masih bisa dipindah jadwal
+     */
+    public function canReschedule(): bool
+    {
+        return !$this->isClosed() && $this->status !== 'in_progress';
     }
 }

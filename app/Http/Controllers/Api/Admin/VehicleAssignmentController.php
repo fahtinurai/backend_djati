@@ -30,7 +30,11 @@ class VehicleAssignmentController extends Controller
 
         $driver = User::findOrFail($request->driver_id);
 
-        if ($driver->role !== 'driver') {
+        $driverRole = is_object($driver->role)
+            ? strtolower($driver->role->name ?? '')
+            : strtolower($driver->role ?? '');
+
+        if ($driverRole !== 'driver') {
             return response()->json([
                 'message' => 'User bukan driver'
             ], 400);
@@ -107,6 +111,17 @@ class VehicleAssignmentController extends Controller
     public function destroy(VehicleAssignment $vehicleAssignment)
     {
         $vehicleAssignment->load(['vehicle', 'driver']);
+
+        /*
+        |--------------------------------------------------------------------------
+        | BLOKIR UNASSIGN JIKA MASIH ADA REPORT / MAINTENANCE BERJALAN
+        |--------------------------------------------------------------------------
+        */
+        if ($vehicleAssignment->hasRunningActivity()) {
+            return response()->json([
+                'message' => 'Kendaraan tidak dapat di-unassign karena masih memiliki report atau maintenance yang sedang berjalan.'
+            ], 422);
+        }
 
         $payload = [
             'assignment_id'  => $vehicleAssignment->id,

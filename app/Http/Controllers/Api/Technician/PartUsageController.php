@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api\Technician;
 
 use App\Http\Controllers\Controller;
 use App\Models\DamageReport;
+use App\Models\Part;
 use App\Models\TechnicianPartUsage;
 use Illuminate\Http\Request;
 
@@ -12,6 +13,37 @@ use App\Services\NodeEventPublisher;
 
 class PartUsageController extends Controller
 {
+    /**
+     * Ambil daftar sparepart untuk dipilih teknisi.
+     *
+     * GET /api/technician/parts
+     * GET /api/technician/parts?search=aki
+     */
+    public function parts(Request $request)
+    {
+        $search = trim((string) $request->query('search', ''));
+
+        $query = Part::query()
+            ->select('id', 'name', 'sku', 'stock');
+
+        if ($search !== '') {
+            $query->where(function ($q) use ($search) {
+                $q->where('name', 'like', '%' . $search . '%')
+                    ->orWhere('sku', 'like', '%' . $search . '%');
+            });
+        }
+
+        $parts = $query
+            ->orderBy('name', 'asc')
+            ->limit(50)
+            ->get();
+
+        return response()->json([
+            'message' => 'Daftar sparepart berhasil diambil.',
+            'data' => $parts,
+        ]);
+    }
+
     /**
      * Teknisi request sparepart (BELUM mengurangi stok)
      * POST /api/technician/part-usages
@@ -53,7 +85,7 @@ class PartUsageController extends Controller
             'part_usage.requested',
             [
                 'part_usage_id'    => $usage->id,
-                'status'           => $usage->status, // requested
+                'status'           => $usage->status,
                 'qty'              => (int) $usage->qty,
                 'technician_id'    => (int) $usage->technician_id,
                 'part_id'          => (int) $usage->part_id,
