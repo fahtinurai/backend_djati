@@ -50,6 +50,19 @@ class PartUsageApprovalController extends Controller
     }
 
     /**
+     * Admin list pending sparepart usage
+     * GET /api/admin/part-usages/pending
+     */
+    public function pending(Request $request)
+    {
+        $request->merge([
+            'status' => 'pending',
+        ]);
+
+        return $this->index($request);
+    }
+
+    /**
      * Admin approve request sparepart
      * POST /api/admin/part-usages/{partUsage}/approve
      */
@@ -138,14 +151,14 @@ class PartUsageApprovalController extends Controller
             // 5️⃣ REALTIME SOCKET EVENTS
             // =============================
             NodeEventPublisher::publish('part_usage.approved', [
-                'part_usage_id'   => $partUsage->id,
-                'status'          => 'approved',
-                'qty'             => $qty,
-                'part_id'         => $part->id,
-                'damage_report_id'=> $partUsage->damage_report_id,
-                'stock_after'     => $part->stock,
-                'movement_id'     => $movement->id,
-                'expense'         => $totalCost,
+                'part_usage_id'    => $partUsage->id,
+                'status'           => 'approved',
+                'qty'              => $qty,
+                'part_id'          => $part->id,
+                'damage_report_id' => $partUsage->damage_report_id,
+                'stock_after'      => $part->stock,
+                'movement_id'      => $movement->id,
+                'expense'          => $totalCost,
             ], ['admin']);
 
             NodeEventPublisher::publish('inventory.expense.created', [
@@ -167,6 +180,7 @@ class PartUsageApprovalController extends Controller
 
     /**
      * Admin reject request sparepart
+     * POST /api/admin/part-usages/{partUsage}/reject
      */
     public function reject(Request $request, TechnicianPartUsage $partUsage)
     {

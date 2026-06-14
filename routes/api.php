@@ -19,6 +19,7 @@ use App\Http\Controllers\Api\Admin\FinanceTransactionController;
 use App\Http\Controllers\Api\Admin\PartUsageApprovalController;
 use App\Http\Controllers\Api\Admin\DamageReportController as AdminDamageReportController;
 use App\Http\Controllers\Api\Admin\ServiceBookingApprovalController as AdminBookingApprovalController;
+
 /*
 |--------------------------------------------------------------------------
 | DRIVER CONTROLLERS
@@ -72,7 +73,11 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('fcm/register', [FcmTokenController::class, 'store']);
     Route::post('fcm/unregister', [FcmTokenController::class, 'destroy']);
 
-    // Legacy mobile alias
+    /*
+    |--------------------------------------------------------------------------
+    | LEGACY MOBILE FCM ALIAS
+    |--------------------------------------------------------------------------
+    */
     Route::post('mobile/fcm-token', [FcmTokenController::class, 'store']);
     Route::post('mobile/fcm-token/delete', [FcmTokenController::class, 'destroy']);
 
@@ -83,12 +88,26 @@ Route::middleware('auth:sanctum')->group(function () {
     */
     Route::middleware('role:admin')->prefix('admin')->group(function () {
 
+        /*
+        |--------------------------------------------------------------------------
+        | DASHBOARD
+        |--------------------------------------------------------------------------
+        */
         Route::get('dashboard', [DashboardController::class, 'index']);
+        Route::get('dashboard/chart', [DashboardController::class, 'chart']);
 
         /*
         |--------------------------------------------------------------------------
         | USERS & VEHICLES
         |--------------------------------------------------------------------------
+        |
+        | Vehicle flow:
+        | 1. Admin membuat kendaraan.
+        | 2. Admin mengisi initial_hour_meter / initial_kpi.
+        | 3. initial tidak diubah oleh teknisi.
+        | 4. Teknisi nantinya hanya update current_hour_meter / latest_hour_meter
+        |    melalui ServiceJobController ketika pekerjaan selesai.
+        |
         */
         Route::apiResource('users', UserController::class);
         Route::apiResource('vehicles', VehicleController::class);
@@ -97,6 +116,13 @@ Route::middleware('auth:sanctum')->group(function () {
         |--------------------------------------------------------------------------
         | VEHICLE ASSIGNMENT
         |--------------------------------------------------------------------------
+        |
+        | Flow:
+        | VehiclePage.jsx
+        | -> admin membuat kendaraan
+        | -> admin assign kendaraan ke driver
+        | -> driver membaca kendaraan melalui /api/driver/my-vehicle
+        |
         */
         Route::get('vehicle-assignments', [VehicleAssignmentController::class, 'index']);
         Route::post('vehicle-assignments', [VehicleAssignmentController::class, 'store']);
@@ -116,9 +142,33 @@ Route::middleware('auth:sanctum')->group(function () {
 
         Route::post('damage-reports/{damageReport}/complete', [AdminDamageReportController::class, 'markAsCompleted']);
         Route::post('damage-reports/{damageReport}/approve-follow-up', [AdminDamageReportController::class, 'markAsCompleted']);
+        Route::post('damage-reports/{damageReport}/approve-followup', [AdminDamageReportController::class, 'markAsCompleted']);
+
+        Route::post('damage-reports/{damageReport}/reject', [AdminDamageReportController::class, 'reject']);
+        Route::post('damage-reports/{damageReport}/reject-report', [AdminDamageReportController::class, 'reject']);
 
         Route::post(
             'damage-reports/{damageReport}/store-finished-repair',
+            [AdminDamageReportController::class, 'storeFinishedRepairHistory']
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | DAMAGE REPORTS LEGACY ALIAS
+        |--------------------------------------------------------------------------
+        */
+        Route::get('reports', [AdminDamageReportController::class, 'index']);
+        Route::get('reports/{damageReport}', [AdminDamageReportController::class, 'show']);
+
+        Route::post('reports/{damageReport}/complete', [AdminDamageReportController::class, 'markAsCompleted']);
+        Route::post('reports/{damageReport}/approve-follow-up', [AdminDamageReportController::class, 'markAsCompleted']);
+        Route::post('reports/{damageReport}/approve-followup', [AdminDamageReportController::class, 'markAsCompleted']);
+
+        Route::post('reports/{damageReport}/reject', [AdminDamageReportController::class, 'reject']);
+        Route::post('reports/{damageReport}/reject-report', [AdminDamageReportController::class, 'reject']);
+
+        Route::post(
+            'reports/{damageReport}/store-finished-repair',
             [AdminDamageReportController::class, 'storeFinishedRepairHistory']
         );
 
@@ -139,6 +189,13 @@ Route::middleware('auth:sanctum')->group(function () {
         |--------------------------------------------------------------------------
         | SPAREPART APPROVAL
         |--------------------------------------------------------------------------
+        |
+        | Flow:
+        | 1. Teknisi request sparepart dari mobile.
+        | 2. Request masuk ke admin.
+        | 3. Admin approve / reject.
+        | 4. Jika approve, backend sebaiknya mengurangi stok.
+        |
         */
         Route::get('part-usages/pending', [PartUsageApprovalController::class, 'pending']);
         Route::get('part-usages', [PartUsageApprovalController::class, 'index']);
@@ -170,24 +227,31 @@ Route::middleware('auth:sanctum')->group(function () {
         | BOOKING APPROVAL / MAINTENANCE SCHEDULING
         |--------------------------------------------------------------------------
         |
-        | Digunakan oleh React Admin MaintenanceScheduling:
-        | GET  /api/admin/bookings?status=requested
-        | GET  /api/admin/bookings?status=all
-        | GET  /api/admin/technicians
-        | POST /api/admin/bookings/{booking}/approve
-        | POST /api/admin/bookings/{booking}/reschedule
-        | POST /api/admin/bookings/{booking}/cancel
+        | Flow:
+        | 1. Driver membuat booking dari damage report.
+        | 2. Admin melihat booking di Maintenance Scheduling.
+        | 3. Admin memilih teknisi.
+        | 4. Booking masuk ke teknisi terpilih.
+        | 5. Teknisi start / complete job dari mobile.
         |
         */
         Route::get('bookings', [AdminBookingApprovalController::class, 'index']);
 
-        // Digunakan dropdown mechanic / technician di React Admin
+        /*
+        |--------------------------------------------------------------------------
+        | DROPDOWN TECHNICIAN
+        |--------------------------------------------------------------------------
+        |
+        | Dipakai React Admin untuk memilih teknisi.
+        | Backend harus filter role = teknisi agar dropdown tidak menampilkan
+        | admin / driver.
+        |
+        */
         Route::get('technicians', [AdminBookingApprovalController::class, 'technicians']);
 
         Route::post('bookings/{booking}/approve', [AdminBookingApprovalController::class, 'approve']);
         Route::post('bookings/{booking}/reschedule', [AdminBookingApprovalController::class, 'reschedule']);
         Route::post('bookings/{booking}/cancel', [AdminBookingApprovalController::class, 'cancel']);
-
     });
 
     /*
@@ -199,10 +263,66 @@ Route::middleware('auth:sanctum')->group(function () {
 
         /*
         |--------------------------------------------------------------------------
-        | DRIVER VEHICLES
+        | DRIVER VEHICLE ASSIGNMENT
         |--------------------------------------------------------------------------
+        |
+        | Endpoint yang dipakai Flutter:
+        | GET /api/driver/my-vehicle
+        |
+        | Response ideal:
+        | {
+        |   "data": {
+        |     "id": 1,
+        |     "vehicle_id": 1,
+        |     "driver_id": 2,
+        |     "assigned_at": "...",
+        |     "vehicle": {
+        |       "id": 1,
+        |       "equipment_name": "...",
+        |       "plate_number": "...",
+        |       "serial_number": "...",
+        |       "initial_kpi": 100,
+        |       "initial_hour_meter": 100,
+        |       "current_hour_meter": 180,
+        |       "target_availability": 90,
+        |       "current_ma": 94.5,
+        |       "status": "active"
+        |     }
+        |   }
+        | }
+        |
+        | Catatan:
+        | initial_hour_meter tetap data awal dari admin.
+        | current_hour_meter / current_ma diupdate setelah teknisi complete job.
+        |
+        */
+        /*
+        |--------------------------------------------------------------------------
+        | PENTING - DRIVER MY VEHICLE
+        |--------------------------------------------------------------------------
+        |
+        | Endpoint ini dipakai Flutter DamageReportPage.dart.
+        | Arahkan ke DriverDamageReportController, bukan Admin VehicleAssignmentController,
+        | supaya response assigned unit membawa HM terbaru dari vehicleResponse:
+        | - current_hour_meter
+        | - latest_hour_meter
+        | - final_hour_meter
+        | - hour_meter_terbaru
+        | - current_ma
+        |
         */
         Route::get('my-vehicle', [DriverDamageReportController::class, 'myVehicle']);
+        Route::get('my-assigned-vehicle', [DriverDamageReportController::class, 'myVehicle']);
+
+        /*
+        |--------------------------------------------------------------------------
+        | DRIVER VEHICLES LEGACY
+        |--------------------------------------------------------------------------
+        |
+        | Tetap dipertahankan agar UI lama yang mengambil daftar kendaraan
+        | dari DamageReportController tidak langsung rusak.
+        |
+        */
         Route::get('vehicles', [DriverDamageReportController::class, 'myVehicles']);
         Route::post('vehicles/verify', [DriverDamageReportController::class, 'verifyVehicle']);
 
@@ -219,6 +339,14 @@ Route::middleware('auth:sanctum')->group(function () {
         |--------------------------------------------------------------------------
         | DRIVER DAMAGE REPORTS
         |--------------------------------------------------------------------------
+        |
+        | Flow:
+        | 1. Driver membuka DamageReportPage.dart.
+        | 2. Flutter mengambil kendaraan dari /api/driver/my-vehicle.
+        | 3. Driver submit laporan ke /api/driver/damage-reports.
+        | 4. Backend menyimpan image ke storage public.
+        | 5. Response mengembalikan id + image_url.
+        |
         */
         Route::get('damage-reports', [DriverDamageReportController::class, 'index']);
         Route::post('damage-reports', [DriverDamageReportController::class, 'store']);
@@ -231,7 +359,7 @@ Route::middleware('auth:sanctum')->group(function () {
         | DRIVER SERVICE BOOKING
         |--------------------------------------------------------------------------
         |
-        | Alur:
+        | Flow:
         | 1. Driver membuat damage report.
         | 2. Flutter memanggil:
         |    POST /api/driver/damage-reports/{damageReport}/booking
@@ -239,6 +367,13 @@ Route::middleware('auth:sanctum')->group(function () {
         | 4. Admin melihat booking di Maintenance Scheduling.
         | 5. Setelah admin approve, driver melihat jadwal di:
         |    GET /api/driver/bookings
+        |
+        | Data booking driver sebaiknya include:
+        | - damage_report
+        | - vehicle
+        | - technician
+        | - mttr / mtbf / ma
+        | - final_hour_meter / current_hour_meter
         |
         */
         Route::get('bookings', [DriverServiceBookingController::class, 'index']);
@@ -274,11 +409,8 @@ Route::middleware('auth:sanctum')->group(function () {
         | TECHNICIAN DAMAGE REPORTS - LEGACY
         |--------------------------------------------------------------------------
         |
-        | Route lama. Masih dipertahankan agar fitur lama tidak langsung rusak.
-        |
-        | GET  /api/technician/damage-reports
-        | GET  /api/technician/damage-reports/{damageReport}
-        | POST /api/technician/damage-reports/{damageReport}/respond
+        | Route lama tetap dipertahankan agar page lama tidak langsung rusak.
+        | Untuk flow baru, teknisi sebaiknya memakai service-jobs.
         |
         */
         Route::get('damage-reports', [TechnicianDamageReportController::class, 'index']);
@@ -292,30 +424,66 @@ Route::middleware('auth:sanctum')->group(function () {
         | TECHNICIAN SERVICE JOB / MAINTENANCE SCHEDULING
         |--------------------------------------------------------------------------
         |
-        | Route baru yang dipakai Flutter maintenance scheduling:
+        | Flow:
+        | 1. Admin approve booking dan memilih technician_id.
+        | 2. Teknisi login melihat job miliknya:
+        |    GET /api/technician/service-jobs?status=active
+        | 3. Teknisi start job:
+        |    POST /api/technician/service-jobs/{booking}/start
+        | 4. Teknisi complete job:
+        |    POST /api/technician/service-jobs/{booking}/complete
         |
-        | GET  /api/technician/service-jobs?status=active
-        | GET  /api/technician/service-jobs?status=all
-        | GET  /api/technician/service-jobs/{booking}
-        | POST /api/technician/service-jobs/{booking}/start
-        | POST /api/technician/service-jobs/{booking}/complete
+        | Complete job menerima data mentah:
+        | - final_hour_meter
+        | - current_hour_meter
+        | - latest_hour_meter
+        | - total_repair_time
+        | - total_operational_time
+        | - failure_count
+        | - actual_operating_hours
+        | - breakdown_hours
         |
-        | Route lama /jobs juga dipertahankan sebagai alias:
+        | Backend yang sebaiknya menghitung:
+        | - mttr
+        | - mtbf
+        | - ma
         |
-        | GET  /api/technician/jobs
-        | GET  /api/technician/jobs/{booking}
-        | POST /api/technician/jobs/{booking}/start
-        | POST /api/technician/jobs/{booking}/complete
+        | Backend yang sebaiknya update:
+        | - service_bookings.status = completed
+        | - service_bookings.completed_at
+        | - vehicles.current_hour_meter
+        | - vehicles.current_ma
+        | - damage_reports.status
+        | - repair history
         |
         */
-
-        // New maintenance scheduling route
         Route::get('service-jobs', [ServiceJobController::class, 'index']);
         Route::get('service-jobs/{booking}', [ServiceJobController::class, 'show']);
         Route::post('service-jobs/{booking}/start', [ServiceJobController::class, 'start']);
         Route::post('service-jobs/{booking}/complete', [ServiceJobController::class, 'complete']);
 
-        // Legacy alias route
+        /*
+        |--------------------------------------------------------------------------
+        | TECHNICIAN SERVICE JOB - MAINTENANCE DATA ALIAS
+        |--------------------------------------------------------------------------
+        |
+        | Alias ini tidak mengubah struktur lama.
+        | Tetap diarahkan ke method complete karena controller yang sama
+        | yang harus menangani update data maintenance.
+        |
+        | Dipakai jika nanti Flutter ingin endpoint yang lebih jelas:
+        | POST /api/technician/service-jobs/{booking}/maintenance-data
+        | POST /api/technician/service-jobs/{booking}/update-maintenance-data
+        |
+        */
+        Route::post('service-jobs/{booking}/maintenance-data', [ServiceJobController::class, 'complete']);
+        Route::post('service-jobs/{booking}/update-maintenance-data', [ServiceJobController::class, 'complete']);
+
+        /*
+        |--------------------------------------------------------------------------
+        | LEGACY ALIAS ROUTE
+        |--------------------------------------------------------------------------
+        */
         Route::get('jobs', [ServiceJobController::class, 'index']);
         Route::get('jobs/{booking}', [ServiceJobController::class, 'show']);
         Route::post('jobs/{booking}/start', [ServiceJobController::class, 'start']);
@@ -323,17 +491,45 @@ Route::middleware('auth:sanctum')->group(function () {
 
         /*
         |--------------------------------------------------------------------------
+        | LEGACY ALIAS - MAINTENANCE DATA
+        |--------------------------------------------------------------------------
+        */
+        Route::post('jobs/{booking}/maintenance-data', [ServiceJobController::class, 'complete']);
+        Route::post('jobs/{booking}/update-maintenance-data', [ServiceJobController::class, 'complete']);
+
+        /*
+        |--------------------------------------------------------------------------
         | SPAREPART USAGE
         |--------------------------------------------------------------------------
         |
-        | GET  /api/technician/parts?search=...
-        | POST /api/technician/part-usages
-        | GET  /api/technician/my-part-usages
+        | Flow:
+        | 1. Teknisi membuka job.
+        | 2. Teknisi start job.
+        | 3. Saat status in_progress, teknisi request sparepart.
+        | 4. Request sparepart sebaiknya membawa:
+        |    - part_id
+        |    - damage_report_id
+        |    - service_booking_id / booking_id
+        |    - qty
+        |    - note
+        | 5. Admin approve / reject dari route admin.
         |
         */
         Route::get('parts', [TechnicianPartUsageController::class, 'parts']);
         Route::post('part-usages', [TechnicianPartUsageController::class, 'store']);
+
+        /*
+        |--------------------------------------------------------------------------
+        | TECHNICIAN PART USAGE HISTORY
+        |--------------------------------------------------------------------------
+        |
+        | my-part-usages dipakai mobile sekarang.
+        | part-usages GET ditambahkan sebagai alias agar lebih konsisten
+        | jika service Flutter memakai /technician/part-usages.
+        |
+        */
         Route::get('my-part-usages', [TechnicianPartUsageController::class, 'myUsages']);
+        Route::get('part-usages', [TechnicianPartUsageController::class, 'myUsages']);
 
         /*
         |--------------------------------------------------------------------------

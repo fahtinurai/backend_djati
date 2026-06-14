@@ -35,13 +35,14 @@ class User extends Authenticatable
 
     /**
      * Cast otomatis
+     *
+     * Catatan:
+     * is_active wajib dibuat boolean supaya frontend membaca status user dengan stabil.
      */
-    protected function casts(): array
-    {
-        return [
-            'email_verified_at' => 'datetime',
-        ];
-    }
+    protected $casts = [
+        'email_verified_at' => 'datetime',
+        'is_active'         => 'boolean',
+    ];
 
     /**
      * Relasi ke kendaraan yang di-assign ke driver
@@ -52,7 +53,18 @@ class User extends Authenticatable
     }
 
     /**
-     * Relasi laporan kerusakan (driver)
+     * Relasi kendaraan aktif / assignment terbaru milik driver
+     *
+     * Dipakai jika sistem 1 driver = 1 kendaraan aktif.
+     */
+    public function latestVehicleAssignment()
+    {
+        return $this->hasOne(VehicleAssignment::class, 'driver_id')
+            ->latestOfMany('assigned_at');
+    }
+
+    /**
+     * Relasi laporan kerusakan milik driver
      */
     public function damageReports()
     {
@@ -60,10 +72,50 @@ class User extends Authenticatable
     }
 
     /**
-     * Relasi jawaban teknisi
+     * Relasi booking service milik driver
+     */
+    public function driverServiceBookings()
+    {
+        return $this->hasMany(ServiceBooking::class, 'driver_id');
+    }
+
+    /**
+     * Relasi booking service yang ditugaskan ke teknisi
+     */
+    public function technicianServiceBookings()
+    {
+        return $this->hasMany(ServiceBooking::class, 'technician_id');
+    }
+
+    /**
+     * Relasi jawaban / response teknisi
      */
     public function technicianResponses()
     {
         return $this->hasMany(TechnicianResponse::class, 'technician_id');
+    }
+
+    /**
+     * Helper: cek apakah user adalah admin.
+     */
+    public function isAdmin(): bool
+    {
+        return $this->role === 'admin';
+    }
+
+    /**
+     * Helper: cek apakah user adalah driver.
+     */
+    public function isDriver(): bool
+    {
+        return $this->role === 'driver';
+    }
+
+    /**
+     * Helper: cek apakah user adalah teknisi.
+     */
+    public function isTechnician(): bool
+    {
+        return $this->role === 'teknisi';
     }
 }

@@ -10,9 +10,9 @@ class DamageReport extends Model
     protected $table = 'damage_reports';
 
     /*
-    |--------------------------------------------------
+    |--------------------------------------------------------------------------
     | MASS ASSIGNMENT
-    |--------------------------------------------------
+    |--------------------------------------------------------------------------
     */
     protected $fillable = [
         'vehicle_id',
@@ -24,9 +24,9 @@ class DamageReport extends Model
     ];
 
     /*
-    |--------------------------------------------------
+    |--------------------------------------------------------------------------
     | CASTING
-    |--------------------------------------------------
+    |--------------------------------------------------------------------------
     */
     protected $casts = [
         'created_at' => 'datetime',
@@ -34,21 +34,41 @@ class DamageReport extends Model
     ];
 
     /*
-    |--------------------------------------------------
+    |--------------------------------------------------------------------------
     | APPENDS
-    |--------------------------------------------------
+    |--------------------------------------------------------------------------
+    |
+    | Penyesuaian:
+    | - image_url tetap untuk akses gambar
+    | - computed_status tetap untuk status laporan
+    | - vehicle_initial_hour_meter ditambahkan agar aman untuk frontend/mobile
+    |   yang sudah memakai istilah Hour Meter Awal
+    |
     */
     protected $appends = [
         'image_url',
         'computed_status',
         'computed_status_label',
         'responsible_technician_id',
+
+        /*
+        |--------------------------------------------------------------------------
+        | COMPATIBILITY DENGAN VEHICLE PAGE / VEHICLE ASSIGNMENT
+        |--------------------------------------------------------------------------
+        */
+        'vehicle_equipment_name',
+        'vehicle_plate_number',
+        'vehicle_serial_number',
+        'vehicle_initial_kpi',
+        'vehicle_initial_hour_meter',
+        'vehicle_target_availability',
+        'vehicle_status',
     ];
 
     /*
-    |--------------------------------------------------
-    | IMAGE FIX (AMAN + FLEXIBLE)
-    |--------------------------------------------------
+    |--------------------------------------------------------------------------
+    | IMAGE URL
+    |--------------------------------------------------------------------------
     */
     public function getImageUrlAttribute(): ?string
     {
@@ -56,24 +76,21 @@ class DamageReport extends Model
             return null;
         }
 
-        // sudah full URL (S3 / CDN / external)
         if (str_starts_with($this->image, 'http')) {
             return $this->image;
         }
 
-        // cek file exists di storage (lebih aman)
         if (Storage::disk('public')->exists($this->image)) {
             return asset('storage/' . $this->image);
         }
 
-        // fallback tetap return URL meskipun file tidak ketemu
         return asset('storage/' . $this->image);
     }
 
     /*
-    |--------------------------------------------------
-    | RELATIONS (TIDAK DIUBAH)
-    |--------------------------------------------------
+    |--------------------------------------------------------------------------
+    | RELATIONS
+    |--------------------------------------------------------------------------
     */
 
     public function vehicle()
@@ -114,9 +131,119 @@ class DamageReport extends Model
     }
 
     /*
-    |--------------------------------------------------
-    | COMPUTED STATUS (FIX NULL SAFE)
-    |--------------------------------------------------
+    |--------------------------------------------------------------------------
+    | SPARE PART USAGE RELATIONS
+    |--------------------------------------------------------------------------
+    */
+
+    public function partUsages()
+    {
+        return $this->hasMany(PartUsage::class, 'damage_report_id', 'id')
+            ->orderBy('created_at', 'desc');
+    }
+
+    public function pendingPartUsages()
+    {
+        return $this->hasMany(PartUsage::class, 'damage_report_id', 'id')
+            ->whereIn('status', ['pending', 'requested'])
+            ->orderBy('created_at', 'desc');
+    }
+
+    public function approvedPartUsages()
+    {
+        return $this->hasMany(PartUsage::class, 'damage_report_id', 'id')
+            ->where('status', 'approved')
+            ->orderBy('created_at', 'desc');
+    }
+
+    public function rejectedPartUsages()
+    {
+        return $this->hasMany(PartUsage::class, 'damage_report_id', 'id')
+            ->where('status', 'rejected')
+            ->orderBy('created_at', 'desc');
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | VEHICLE COMPATIBILITY ACCESSORS
+    |--------------------------------------------------------------------------
+    |
+    | Bagian ini tidak mengubah struktur database.
+    | Tujuannya hanya supaya response DamageReport tetap nyambung dengan:
+    | - VehiclesPage.jsx
+    | - VehicleAssignment
+    | - Driver DamageReportPage.dart
+    |
+    | Database lama:
+    | - vehicles.initial_kpi
+    |
+    | Tampilan baru:
+    | - initial_hour_meter
+    |
+    */
+
+    private function resolvedVehicle(): ?Vehicle
+    {
+        if ($this->relationLoaded('vehicle')) {
+            return $this->vehicle;
+        }
+
+        return $this->vehicle()->first();
+    }
+
+    public function getVehicleEquipmentNameAttribute(): ?string
+    {
+        $vehicle = $this->resolvedVehicle();
+
+        return $vehicle?->equipment_name;
+    }
+
+    public function getVehiclePlateNumberAttribute(): ?string
+    {
+        $vehicle = $this->resolvedVehicle();
+
+        return $vehicle?->plate_number;
+    }
+
+    public function getVehicleSerialNumberAttribute(): ?string
+    {
+        $vehicle = $this->resolvedVehicle();
+
+        return $vehicle?->serial_number;
+    }
+
+    public function getVehicleInitialKpiAttribute()
+    {
+        $vehicle = $this->resolvedVehicle();
+
+        return $vehicle?->initial_kpi;
+    }
+
+    public function getVehicleInitialHourMeterAttribute()
+    {
+        $vehicle = $this->resolvedVehicle();
+
+        return $vehicle?->initial_hour_meter ?? $vehicle?->initial_kpi ?? 0;
+    }
+
+    public function getVehicleTargetAvailabilityAttribute()
+    {
+        $vehicle = $this->resolvedVehicle();
+
+        return $vehicle?->target_availability ?? $vehicle?->target_ma ?? 90;
+    }
+
+    public function getVehicleStatusAttribute(): string
+    {
+        $vehicle = $this->resolvedVehicle();
+
+        return $vehicle?->status ?? $vehicle?->unit_status ?? 'active';
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | COMPUTED STATUS
+    |--------------------------------------------------------------------------
     */
 
     public function getComputedStatusAttribute(): string
@@ -124,6 +251,25 @@ class DamageReport extends Model
         $latest = $this->relationLoaded('latestTechnicianResponse')
             ? $this->latestTechnicianResponse
             : $this->latestTechnicianResponse()->first();
+
+        $booking = $this->relationLoaded('booking')
+            ? $this->booking
+            : $this->booking()->first();
+
+        /*
+        |--------------------------------------------------------------------------
+        | Prioritas status:
+        | 1. Jika service booking sudah completed, maka damage report dianggap selesai.
+        | 2. Jika technician response ada, pakai status response teknisi.
+        | 3. Jika tidak ada, pakai status damage_reports.
+        |--------------------------------------------------------------------------
+        */
+        if (
+            $booking &&
+            in_array($this->normalizeStatus($booking->status), ['selesai'], true)
+        ) {
+            return 'selesai';
+        }
 
         $status = $latest?->status
             ?? $this->status
@@ -137,9 +283,12 @@ class DamageReport extends Model
         return match ($this->computed_status) {
             'menunggu' => 'Reported',
             'proses' => 'In Progress',
-            'butuh_followup_admin' => 'On Hold',
+            'butuh_followup_admin' => 'Waiting Parts',
+            'approved_followup_admin' => 'Follow-up Approved',
             'fatal' => 'Fatal',
-            'selesai' => 'Finished',
+            'selesai' => 'Completed',
+            'rejected' => 'Rejected',
+            'canceled' => 'Canceled',
             default => 'Reported',
         };
     }
@@ -150,13 +299,22 @@ class DamageReport extends Model
             ? $this->latestTechnicianResponse
             : $this->latestTechnicianResponse()->first();
 
-        return $latest?->technician_id ? (int) $latest->technician_id : null;
+        $booking = $this->relationLoaded('booking')
+            ? $this->booking
+            : $this->booking()->first();
+
+        $technicianId =
+            $latest?->technician_id
+            ?? $booking?->technician_id
+            ?? null;
+
+        return $technicianId ? (int) $technicianId : null;
     }
 
     /*
-    |--------------------------------------------------
-    | HELPERS
-    |--------------------------------------------------
+    |--------------------------------------------------------------------------
+    | STATUS HELPERS
+    |--------------------------------------------------------------------------
     */
 
     public function isReported(): bool
@@ -174,6 +332,11 @@ class DamageReport extends Model
         return $this->computed_status === 'butuh_followup_admin';
     }
 
+    public function isFollowUpApproved(): bool
+    {
+        return $this->computed_status === 'approved_followup_admin';
+    }
+
     public function isFatal(): bool
     {
         return $this->computed_status === 'fatal';
@@ -184,10 +347,20 @@ class DamageReport extends Model
         return $this->computed_status === 'selesai';
     }
 
+    public function isRejected(): bool
+    {
+        return $this->computed_status === 'rejected';
+    }
+
+    public function isCanceled(): bool
+    {
+        return $this->computed_status === 'canceled';
+    }
+
     /*
-    |--------------------------------------------------
-    | NORMALIZER (ROBUST + FUTURE SAFE)
-    |--------------------------------------------------
+    |--------------------------------------------------------------------------
+    | NORMALIZER
+    |--------------------------------------------------------------------------
     */
 
     public function normalizeStatus(?string $status): string
@@ -200,31 +373,90 @@ class DamageReport extends Model
         $status = str_replace([' ', '-'], '_', $status);
 
         return match ($status) {
-
-            // waiting state
+            /*
+            |--------------------------------------------------------------------------
+            | Waiting / Reported
+            |--------------------------------------------------------------------------
+            */
             'reported',
             'waiting',
+            'pending',
+            'requested',
             'menunggu' => 'menunggu',
 
-            // in progress
+            /*
+            |--------------------------------------------------------------------------
+            | In Progress
+            |--------------------------------------------------------------------------
+            */
+            'approved',
+            'scheduled',
+            'rescheduled',
             'ongoing',
             'in_progress',
+            'progress',
+            'on_progress',
             'diproses',
-            'proses' => 'proses',
+            'proses',
+            'started',
+            'job_started',
+            'repair_started',
+            'technician_started',
+            'working' => 'proses',
 
-            // hold state
+            /*
+            |--------------------------------------------------------------------------
+            | Waiting Parts / Follow-up
+            |--------------------------------------------------------------------------
+            */
             'on_hold',
             'waiting_parts',
+            'menunggu_sparepart',
             'butuh_followup',
             'butuh_followup_admin' => 'butuh_followup_admin',
 
-            // finished
+            /*
+            |--------------------------------------------------------------------------
+            | Follow-up Approved
+            |--------------------------------------------------------------------------
+            */
+            'approved_followup_admin',
+            'followup_approved',
+            'follow_up_approved' => 'approved_followup_admin',
+
+            /*
+            |--------------------------------------------------------------------------
+            | Finished / Completed
+            |--------------------------------------------------------------------------
+            */
             'finished',
             'completed',
+            'complete',
+            'done',
+            'closed',
             'selesai' => 'selesai',
 
-            // critical
-            'fatal' => 'fatal',
+            /*
+            |--------------------------------------------------------------------------
+            | Fatal
+            |--------------------------------------------------------------------------
+            */
+            'fatal',
+            'critical' => 'fatal',
+
+            /*
+            |--------------------------------------------------------------------------
+            | Rejected / Canceled
+            |--------------------------------------------------------------------------
+            */
+            'reject',
+            'rejected',
+            'ditolak' => 'rejected',
+
+            'cancel',
+            'canceled',
+            'cancelled',
+            'dibatalkan' => 'canceled',
 
             default => 'menunggu',
         };
