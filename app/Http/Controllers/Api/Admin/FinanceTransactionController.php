@@ -6,23 +6,80 @@ use App\Http\Controllers\Controller;
 use App\Models\FinanceTransaction;
 use Illuminate\Http\Request;
 use App\Services\NodeEventPublisher;
+use Carbon\Carbon;
 
 class FinanceTransactionController extends Controller
 {
     /**
+     * Timezone aplikasi.
+     * Dipakai agar tanggal transaksi tidak bergeser karena UTC/server timezone.
+     */
+    private string $timezone = 'Asia/Jakarta';
+
+    /**
+     * NORMALISASI TANGGAL
+     *
+     * Tujuan:
+     * - Jika frontend mengirim YYYY-MM-DD, tanggal disimpan tetap sesuai input.
+     * - Jika frontend mengirim ISO/UTC, tanggal dikonversi dulu ke Asia/Jakarta.
+     * - Database menyimpan tanggal dalam format Y-m-d agar stabil.
+     */
+    private function normalizeDate(string $value): string
+    {
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) {
+            return Carbon::createFromFormat('Y-m-d', $value, $this->timezone)
+                ->toDateString();
+        }
+
+        return Carbon::parse($value)
+            ->setTimezone($this->timezone)
+            ->toDateString();
+    }
+
+    /**
      * LIST TRANSAKSI
+     *
      * GET /api/admin/transactions?month=YYYY-MM&type=income|expense&source=manual|repair|inventory
      */
     public function index(Request $request)
     {
-        $month  = (string) $request->query('month', '');
-        $type   = (string) $request->query('type', '');
-        $source = (string) $request->query('source', '');
+        $month  = trim((string) $request->query('month', ''));
+        $type   = strtolower(trim((string) $request->query('type', '')));
+        $source = strtolower(trim((string) $request->query('source', '')));
+
+        if (in_array($type, ['all', 'semua', 'semua jenis'], true)) {
+            $type = '';
+        }
+
+        if (in_array($source, ['all', 'semua', 'semua sumber'], true)) {
+            $source = '';
+        }
 
         $q = FinanceTransaction::query();
 
+        /**
+         * FILTER BULAN
+         *
+         * Sebelumnya:
+         * DATE_FORMAT(date, '%Y-%m')
+         *
+         * Diganti menjadi range tanggal agar lebih aman
+         * dan tidak rawan error ketika date berbentuk datetime/timestamp.
+         */
         if ($month !== '') {
-            $q->whereRaw("DATE_FORMAT(date, '%Y-%m') = ?", [$month]);
+            if (!preg_match('/^\d{4}-(0[1-9]|1[0-2])$/', $month)) {
+                return response()->json([
+                    'message' => 'Format month harus YYYY-MM, contoh: 2026-06.'
+                ], 422);
+            }
+
+            $start = Carbon::createFromFormat('Y-m', $month, $this->timezone)
+                ->startOfMonth();
+
+            $nextMonth = $start->copy()->addMonth();
+
+            $q->where('date', '>=', $start->toDateString())
+              ->where('date', '<', $nextMonth->toDateString());
         }
 
         if ($type !== '') {
@@ -33,18 +90,31 @@ class FinanceTransactionController extends Controller
             $q->where('source', $source);
         }
 
-        return response()->json(
-            $q->orderBy('date', 'desc')
-              ->orderBy('id', 'desc')
-              ->get()
-        );
+        $rows = $q->orderBy('date', 'desc')
+            ->orderBy('id', 'desc')
+            ->get()
+            ->map(function ($tx) {
+                /**
+                 * PENTING:
+                 * Ambil tanggal asli dari database.
+                 * Jangan pakai hasil cast Carbon karena bisa berubah ke UTC
+                 * dan tampil maju/mundur 1 hari di frontend.
+                 */
+                $tx->date = $tx->getRawOriginal('date');
+
+                return $tx;
+            });
+
+        return response()->json($rows);
     }
 
     /**
      * CREATE TRANSACTION
-     * 🔒 RULE:
-     * - Income → boleh manual
-     * - Expense → TIDAK BOLEH manual (harus dari repair / inventory)
+     *
+     * RULE:
+     * - Income boleh manual
+     * - Expense tidak boleh manual
+     * - Expense harus berasal dari repair / inventory
      */
     public function store(Request $request)
     {
@@ -60,28 +130,42 @@ class FinanceTransactionController extends Controller
 
         $source = $data['source'] ?? 'manual';
 
-        // ❌ Expense tidak boleh manual
+        /**
+         * Expense tidak boleh dibuat manual.
+         */
         if ($data['type'] === 'expense' && $source === 'manual') {
             return response()->json([
                 'message' => 'Expense tidak bisa dibuat manual.'
             ], 422);
         }
 
-        // 🔒 Expense selalu locked
+        /**
+         * Expense selalu locked.
+         * Income manual tidak locked.
+         */
         $locked = ($data['type'] === 'expense');
+
+        /**
+         * Normalisasi tanggal agar tidak bergeser.
+         */
+        $date = $this->normalizeDate($data['date']);
 
         $tx = FinanceTransaction::create([
             'type'     => $data['type'],
             'category' => $data['category'],
             'amount'   => $data['amount'],
-            'date'     => $data['date'],
+            'date'     => $date,
             'note'     => $data['note'] ?? null,
             'source'   => $source,
             'ref'      => $data['ref'] ?? null,
             'locked'   => $locked,
         ]);
 
-        // 🔴 REALTIME (optional tapi rapi)
+        /**
+         * Paksa tanggal response memakai tanggal asli database.
+         */
+        $tx->date = $tx->getRawOriginal('date');
+
         NodeEventPublisher::publish('finance.transaction.created', [
             'transaction_id' => $tx->id,
             'type'           => $tx->type,
@@ -95,7 +179,9 @@ class FinanceTransactionController extends Controller
 
     /**
      * UPDATE TRANSACTION
-     * 🔒 HANYA income manual yang boleh
+     *
+     * Hanya income yang boleh diedit.
+     * Expense otomatis tidak boleh diedit.
      */
     public function update(Request $request, FinanceTransaction $financeTransaction)
     {
@@ -118,9 +204,19 @@ class FinanceTransactionController extends Controller
             'note'     => 'nullable|string',
         ]);
 
-        $financeTransaction->update($data);
+        /**
+         * Normalisasi tanggal saat update juga.
+         */
+        $data['date'] = $this->normalizeDate($data['date']);
 
-        // 🔴 REALTIME
+        $financeTransaction->update($data);
+        $financeTransaction->refresh();
+
+        /**
+         * Paksa tanggal response memakai tanggal asli database.
+         */
+        $financeTransaction->date = $financeTransaction->getRawOriginal('date');
+
         NodeEventPublisher::publish('finance.transaction.updated', [
             'transaction_id' => $financeTransaction->id,
             'amount'         => $financeTransaction->amount,
@@ -132,7 +228,9 @@ class FinanceTransactionController extends Controller
 
     /**
      * DELETE TRANSACTION
-     * 🔒 HANYA income manual
+     *
+     * Hanya income manual yang boleh dihapus.
+     * Expense otomatis tidak boleh dihapus.
      */
     public function destroy(FinanceTransaction $financeTransaction)
     {
@@ -149,13 +247,15 @@ class FinanceTransactionController extends Controller
         }
 
         $id = $financeTransaction->id;
+
         $financeTransaction->delete();
 
-        // 🔴 REALTIME
         NodeEventPublisher::publish('finance.transaction.deleted', [
             'transaction_id' => $id,
         ], ['admin']);
 
-        return response()->json(['message' => 'Income dihapus']);
+        return response()->json([
+            'message' => 'Income dihapus'
+        ]);
     }
 }

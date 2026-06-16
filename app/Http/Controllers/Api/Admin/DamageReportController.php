@@ -32,33 +32,10 @@ class DamageReportController extends Controller
                 ])
                 ->orderBy('created_at', 'desc');
 
-            if ($request->filled('status')) {
-                $status = $this->normalizeStatus($request->query('status'));
+            $statusFilter = null;
 
-                if ($status === 'menunggu') {
-                    $q->where(function ($query) {
-                        $query->whereDoesntHave('latestTechnicianResponse')
-                            ->orWhere('status', 'menunggu')
-                            ->orWhereNull('status');
-                    });
-                } elseif ($status === 'selesai') {
-                    $q->where(function ($query) {
-                        $query->whereHas('latestTechnicianResponse', function ($response) {
-                            $response->where('status', 'selesai');
-                        })
-                        ->orWhereHas('booking', function ($booking) {
-                            $booking->whereIn('status', [
-                                'completed',
-                                'finished',
-                                'selesai',
-                            ]);
-                        });
-                    });
-                } else {
-                    $q->whereHas('latestTechnicianResponse', function ($response) use ($status) {
-                        $response->where('status', $status);
-                    });
-                }
+            if ($request->filled('status')) {
+                $statusFilter = $this->normalizeStatus($request->query('status'));
             }
 
             if ($request->filled('search')) {
@@ -87,6 +64,19 @@ class DamageReportController extends Controller
             }
 
             $reports = $q->get();
+
+            $reports = $this->attachDamageReportStatusInfo($reports);
+
+            if ($statusFilter) {
+                $reports = $reports
+                    ->filter(function ($report) use ($statusFilter) {
+                        return $this->normalizeStatus(
+                            $report->getAttribute('computed_status')
+                                ?? $report->getAttribute('status')
+                        ) === $statusFilter;
+                    })
+                    ->values();
+            }
 
             $reports = $this->attachRepairHistoryInfo($reports);
             $reports = $this->attachPartUsageInfo($reports);
@@ -123,6 +113,7 @@ class DamageReportController extends Controller
             $damageReport->setAttribute('repair_history_saved', $repair ? true : false);
             $damageReport->setAttribute('repair_history', $repair);
 
+            $this->attachSingleDamageReportStatusInfo($damageReport);
             $this->attachSinglePartUsageInfo($damageReport);
 
             return response()->json($damageReport);
@@ -162,6 +153,7 @@ class DamageReportController extends Controller
                 )
                 ->get();
 
+            $reports = $this->attachDamageReportStatusInfo($reports);
             $reports = $this->attachRepairHistoryInfo($reports);
             $reports = $this->attachPartUsageInfo($reports);
 
@@ -350,6 +342,7 @@ class DamageReportController extends Controller
             $damageReport->setAttribute('repair_history_saved', true);
             $damageReport->setAttribute('repair_history', $repair);
 
+            $this->attachSingleDamageReportStatusInfo($damageReport);
             $this->attachSinglePartUsageInfo($damageReport);
 
             $completedBooking = $this->getCompletedServiceBooking($damageReport);
@@ -405,7 +398,12 @@ class DamageReportController extends Controller
     {
         $request->validate([
             'admin_note' => 'nullable|string',
+            'note'       => 'nullable|string',
         ]);
+
+        $adminNote = $request->admin_note
+            ?? $request->note
+            ?? 'Approved by admin';
 
         $damageReport->load([
             'vehicle',
@@ -425,16 +423,9 @@ class DamageReportController extends Controller
         }
 
         try {
-            DB::transaction(function () use ($request, $damageReport) {
+            DB::transaction(function () use ($damageReport) {
                 $damageReport->update([
                     'status' => 'approved_followup_admin',
-                ]);
-
-                $damageReport->technicianResponses()->create([
-                    'damage_id'      => $damageReport->id,
-                    'technician_id'  => null,
-                    'status'         => 'approved_followup_admin',
-                    'note'           => $request->admin_note ?? 'Approved by admin',
                 ]);
 
                 Repair::firstOrCreate(
@@ -447,8 +438,21 @@ class DamageReportController extends Controller
                     ]
                 );
             });
+
+            /**
+             * Log technician response dibuat terpisah agar proses approve tidak gagal
+             * hanya karena kolom technician_id tidak nullable atau status log tidak cocok.
+             */
+            $this->createAdminTechnicianResponseLog(
+                $damageReport,
+                'approved_followup_admin',
+                $adminNote
+            );
         } catch (\Throwable $e) {
-            Log::error('markAsCompleted error: ' . $e->getMessage());
+            Log::error('markAsCompleted error: ' . $e->getMessage(), [
+                'damage_report_id' => $damageReport->id ?? null,
+                'trace' => $e->getTraceAsString(),
+            ]);
 
             return response()->json([
                 'message' => $e->getMessage(),
@@ -461,7 +465,7 @@ class DamageReportController extends Controller
             NodeEventPublisher::publish('damage_report.followup_approved', [
                 'damage_report_id' => $damageReport->id,
                 'status'           => 'approved_followup_admin',
-                'admin_note'       => $request->admin_note,
+                'admin_note'       => $adminNote,
                 'updated_at'       => now(),
             ], ['admin']);
 
@@ -492,6 +496,8 @@ class DamageReportController extends Controller
         $damageReport->setAttribute('repair_history_saved', $repair ? true : false);
         $damageReport->setAttribute('repair_history', $repair);
 
+        $this->attachSingleDamageReportStatusInfo($damageReport);
+        $this->attachSingleDamageReportStatusInfo($damageReport);
         $this->attachSinglePartUsageInfo($damageReport);
 
         return response()->json([
@@ -508,24 +514,59 @@ class DamageReportController extends Controller
     public function reject(Request $request, DamageReport $damageReport)
     {
         $request->validate([
-            'note' => 'nullable|string',
+            'note'       => 'nullable|string',
+            'reason'     => 'nullable|string',
+            'admin_note' => 'nullable|string',
+            'note_admin' => 'nullable|string',
         ]);
 
-        try {
-            DB::transaction(function () use ($request, $damageReport) {
-                $damageReport->update([
-                    'status' => 'rejected',
-                ]);
+        $note = $request->note
+            ?? $request->reason
+            ?? $request->admin_note
+            ?? $request->note_admin
+            ?? 'Rejected by admin';
 
-                $damageReport->technicianResponses()->create([
-                    'damage_id'     => $damageReport->id,
-                    'technician_id' => null,
-                    'status'        => 'rejected',
-                    'note'          => $request->note ?? 'Rejected by admin',
-                ]);
+        try {
+            DB::transaction(function () use ($damageReport, $note) {
+                $damageReportTable = $damageReport->getTable();
+
+                $updatePayload = [
+                    'status' => 'rejected',
+                ];
+
+                if (Schema::hasColumn($damageReportTable, 'note_admin')) {
+                    $updatePayload['note_admin'] = $note;
+                }
+
+                if (Schema::hasColumn($damageReportTable, 'admin_note')) {
+                    $updatePayload['admin_note'] = $note;
+                }
+
+                if (Schema::hasColumn($damageReportTable, 'rejected_at')) {
+                    $updatePayload['rejected_at'] = now();
+                }
+
+                if (Schema::hasColumn($damageReportTable, 'rejected_by')) {
+                    $updatePayload['rejected_by'] = auth()->id();
+                }
+
+                $damageReport->update($updatePayload);
             });
+
+            /**
+             * Log technician response dibuat terpisah agar proses reject tidak gagal
+             * hanya karena kolom technician_id tidak nullable atau enum status log tidak cocok.
+             */
+            $this->createAdminTechnicianResponseLog(
+                $damageReport,
+                'rejected',
+                $note
+            );
         } catch (\Throwable $e) {
-            Log::error('reject damage report error: ' . $e->getMessage());
+            Log::error('reject damage report error: ' . $e->getMessage(), [
+                'damage_report_id' => $damageReport->id ?? null,
+                'trace' => $e->getTraceAsString(),
+            ]);
 
             return response()->json([
                 'message' => 'Gagal reject damage report.',
@@ -548,6 +589,232 @@ class DamageReportController extends Controller
             'message' => 'Damage report berhasil ditolak.',
             'data' => $damageReport,
         ]);
+    }
+
+    /**
+     * Tambahkan status tampilan ke setiap damage report.
+     *
+     * PENTING:
+     * - Jika booking baru approved/rescheduled, laporan tetap reported/dilaporkan.
+     * - Jika teknisi start job, laporan baru menjadi proses/in_progress.
+     * - Jika booking rejected/canceled/completed, laporan mengikuti status final tersebut.
+     */
+    private function attachDamageReportStatusInfo($reports)
+    {
+        return $reports->map(function ($report) {
+            return $this->attachSingleDamageReportStatusInfo($report);
+        });
+    }
+
+    /**
+     * Tambahkan status tampilan ke satu damage report.
+     */
+    private function attachSingleDamageReportStatusInfo(DamageReport $damageReport)
+    {
+        try {
+            if (!$damageReport->relationLoaded('booking')) {
+                $damageReport->loadMissing('booking');
+            }
+        } catch (\Throwable $e) {
+            // Relasi booking mungkin belum ada di model lama.
+        }
+
+        $booking = $damageReport->relationLoaded('booking')
+            ? $damageReport->booking
+            : null;
+
+        $computedStatus = $this->resolveDamageReportDisplayStatus($damageReport, $booking);
+
+        $damageReport->setAttribute('damage_report_status', $damageReport->getOriginal('status') ?? $damageReport->status);
+        $damageReport->setAttribute('booking_status', $booking?->status);
+        $damageReport->setAttribute('service_booking_status', $booking?->status);
+        $damageReport->setAttribute('computed_status', $computedStatus);
+        $damageReport->setAttribute('display_status', $computedStatus);
+
+        /**
+         * Frontend lama membaca field status langsung.
+         * Karena itu status response disesuaikan agar tidak salah tampil.
+         * Nilai database tidak berubah oleh setAttribute ini selama tidak di-save.
+         */
+        $damageReport->setAttribute('status', $computedStatus);
+
+        return $damageReport;
+    }
+
+    /**
+     * Tentukan status tampilan Damage Report.
+     */
+    private function resolveDamageReportDisplayStatus(DamageReport $damageReport, $booking = null): string
+    {
+        $bookingStatus = $this->normalizeServiceBookingStatus($booking?->status);
+
+        /**
+         * Status final dari booking harus langsung terlihat di laporan.
+         */
+        if ($bookingStatus === 'rejected') {
+            return 'rejected';
+        }
+
+        if ($bookingStatus === 'canceled') {
+            return 'canceled';
+        }
+
+        if ($bookingStatus === 'completed') {
+            return 'selesai';
+        }
+
+        /**
+         * Baru menjadi proses jika teknisi benar-benar start job.
+         */
+        if ($bookingStatus === 'in_progress') {
+            return 'proses';
+        }
+
+        /**
+         * Booking approved/rescheduled hanya berarti admin sudah menjadwalkan.
+         * Teknisi belum mulai kerja, jadi laporan tetap dilaporkan.
+         */
+        if (in_array($bookingStatus, [
+            'requested',
+            'approved',
+            'rescheduled',
+            'scheduled',
+        ], true)) {
+            return 'reported';
+        }
+
+        $latestStatus = $this->normalizeStatus($damageReport->latestTechnicianResponse?->status);
+
+        if (in_array($latestStatus, [
+            'proses',
+            'selesai',
+            'butuh_followup_admin',
+            'approved_followup_admin',
+            'fatal',
+            'rejected',
+            'canceled',
+        ], true)) {
+            return $latestStatus;
+        }
+
+        $reportStatus = $this->normalizeStatus($damageReport->status);
+
+        if (in_array($reportStatus, [
+            'proses',
+            'selesai',
+            'butuh_followup_admin',
+            'approved_followup_admin',
+            'fatal',
+            'rejected',
+            'canceled',
+        ], true)) {
+            return $reportStatus;
+        }
+
+        return 'reported';
+    }
+
+    /**
+     * Normalisasi status service booking tanpa mengubah arti untuk damage report.
+     */
+    private function normalizeServiceBookingStatus(?string $status): ?string
+    {
+        if ($status === null) {
+            return null;
+        }
+
+        $status = strtolower(trim($status));
+        $status = str_replace([' ', '-'], '_', $status);
+
+        return match ($status) {
+            'requested',
+            'pending',
+            'waiting',
+            'reported',
+            'menunggu' => 'requested',
+
+            'approved',
+            'scheduled' => 'approved',
+
+            'rescheduled' => 'rescheduled',
+
+            'in_progress',
+            'ongoing',
+            'proses',
+            'diproses',
+            'started',
+            'job_started',
+            'repair_started',
+            'technician_started',
+            'working' => 'in_progress',
+
+            'completed',
+            'finished',
+            'selesai',
+            'done',
+            'closed' => 'completed',
+
+            'reject',
+            'rejected',
+            'ditolak' => 'rejected',
+
+            'cancel',
+            'canceled',
+            'cancelled',
+            'dibatalkan' => 'canceled',
+
+            default => $status,
+        };
+    }
+
+    /**
+     * Buat log status admin ke technician_responses secara aman.
+     *
+     * Log ini tidak boleh membuat proses utama gagal.
+     * Jika struktur tabel technician_responses berbeda, error hanya dicatat ke log.
+     */
+    private function createAdminTechnicianResponseLog(
+        DamageReport $damageReport,
+        string $status,
+        ?string $note = null
+    ): void {
+        try {
+            $responseTable = (new TechnicianResponse())->getTable();
+
+            if (!Schema::hasTable($responseTable)) {
+                return;
+            }
+
+            $payload = [
+                'status' => $status,
+                'note'   => $note ?: 'Updated by admin',
+            ];
+
+            if (Schema::hasColumn($responseTable, 'damage_id')) {
+                $payload['damage_id'] = $damageReport->id;
+            }
+
+            if (Schema::hasColumn($responseTable, 'damage_report_id')) {
+                $payload['damage_report_id'] = $damageReport->id;
+            }
+
+            if (Schema::hasColumn($responseTable, 'technician_id')) {
+                /**
+                 * Diisi auth()->id() agar tidak gagal jika technician_id tidak nullable.
+                 * Jika database menolak karena constraint role/foreign key, catch di bawah
+                 * akan menangkap error dan proses utama tetap berhasil.
+                 */
+                $payload['technician_id'] = auth()->id();
+            }
+
+            $damageReport->technicianResponses()->create($payload);
+        } catch (\Throwable $e) {
+            Log::warning('Gagal membuat admin technician response log.', [
+                'damage_report_id' => $damageReport->id ?? null,
+                'status' => $status,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /**
@@ -914,14 +1181,22 @@ class DamageReportController extends Controller
         $status = str_replace([' ', '-'], '_', $status);
 
         return match ($status) {
+            /**
+             * Laporan baru / booking approved tetap tampil sebagai reported.
+             */
             'reported',
             'waiting',
             'pending',
             'requested',
-            'menunggu' => 'menunggu',
-
+            'menunggu',
+            'dilaporkan',
             'approved',
             'scheduled',
+            'rescheduled' => 'reported',
+
+            /**
+             * Damage report baru boleh proses jika teknisi sudah start job.
+             */
             'ongoing',
             'in_progress',
             'progress',
@@ -943,6 +1218,8 @@ class DamageReportController extends Controller
             'finished',
             'completed',
             'complete',
+            'done',
+            'closed',
             'selesai' => 'selesai',
 
             'fatal',
@@ -963,5 +1240,4 @@ class DamageReportController extends Controller
 
             default => $status,
         };
-    }
-}
+    }}

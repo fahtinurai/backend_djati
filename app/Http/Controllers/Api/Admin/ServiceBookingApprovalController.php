@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\ServiceBooking;
 use App\Models\User;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use App\Services\NodeEventPublisher;
@@ -14,7 +15,21 @@ class ServiceBookingApprovalController extends Controller
 {
     public function index(Request $request)
     {
-        $status = $request->query('status', 'requested');
+        /*
+        |--------------------------------------------------------------------------
+        | Default halaman Admin Approval Booking
+        |--------------------------------------------------------------------------
+        |
+        | Default hanya menampilkan request booking yang masih perlu diproses admin.
+        | Jika driver cancel atau admin reject, data tetap tersimpan di database,
+        | tetapi tidak lagi tampil di approval aktif.
+        |
+        | Query yang disarankan untuk halaman approval:
+        | GET /api/admin/bookings
+        | GET /api/admin/bookings?status=approval
+        |
+        */
+        $status = $request->query('status', 'approval');
 
         $q = ServiceBooking::with([
             'damageReport.vehicle',
@@ -24,7 +39,38 @@ class ServiceBookingApprovalController extends Controller
             'technician',
         ])->latest();
 
-        if ($status && $status !== 'all') {
+        if ($status === 'approval') {
+            $q->where('status', 'requested');
+        } elseif ($status === 'active') {
+            $q->whereIn('status', [
+                'requested',
+                'approved',
+                'rescheduled',
+                'in_progress',
+            ]);
+        } elseif ($status === 'all') {
+            /*
+             * all untuk halaman admin aktif, bukan history.
+             * Data yang sudah final tidak ditampilkan lagi di approval aktif.
+             */
+            $q->whereNotIn('status', [
+                'canceled',
+                'cancelled',
+                'rejected',
+                'completed',
+                'finished',
+                'selesai',
+            ]);
+        } elseif ($status === 'history') {
+            $q->whereIn('status', [
+                'canceled',
+                'cancelled',
+                'rejected',
+                'completed',
+                'finished',
+                'selesai',
+            ]);
+        } elseif ($status) {
             $q->where('status', $status);
         }
 
@@ -219,7 +265,10 @@ class ServiceBookingApprovalController extends Controller
         ]);
 
         if (!in_array($booking->status, ['requested', 'rescheduled'], true)) {
-            return response()->json(['message' => 'Status tidak valid'], 422);
+            return response()->json([
+                'message' => 'Status tidak valid',
+                'current_status' => $booking->status,
+            ], 422);
         }
 
         $technicianId = $request->technician_id;
@@ -256,6 +305,16 @@ class ServiceBookingApprovalController extends Controller
             'note_admin' => $request->note_admin,
         ]);
 
+        /*
+        |-----------------------------------------
+        | PENTING:
+        |-----------------------------------------
+        | Booking disetujui admin belum berarti teknisi sudah mulai kerja.
+        | Jadi status damage report tetap "reported" / "Dilaporkan".
+        | Damage report baru menjadi in_progress saat teknisi start job.
+        */
+        $this->syncDamageReportStatus($booking, 'reported');
+
         $booking->refresh()->load([
             'damageReport.vehicle',
             'damageReport.driver',
@@ -288,7 +347,10 @@ class ServiceBookingApprovalController extends Controller
         ]);
 
         if (!in_array($booking->status, ['approved', 'rescheduled'], true)) {
-            return response()->json(['message' => 'Tidak bisa reschedule'], 422);
+            return response()->json([
+                'message' => 'Tidak bisa reschedule',
+                'current_status' => $booking->status,
+            ], 422);
         }
 
         $technicianId = $request->technician_id ?? $booking->technician_id;
@@ -331,6 +393,13 @@ class ServiceBookingApprovalController extends Controller
             'note_admin' => $request->note_admin ?? $booking->note_admin,
         ]);
 
+        /*
+        |-----------------------------------------
+        | Reschedule hanya mengubah jadwal.
+        | Teknisi tetap belum start job, jadi damage report tetap reported.
+        */
+        $this->syncDamageReportStatus($booking, 'reported');
+
         $booking->refresh()->load([
             'damageReport.vehicle',
             'damageReport.driver',
@@ -354,7 +423,7 @@ class ServiceBookingApprovalController extends Controller
     */
     public function startJob(ServiceBooking $booking)
     {
-        if (!in_array($booking->status, ['approved', 'rescheduled'])) {
+        if (!in_array($booking->status, ['approved', 'rescheduled'], true)) {
             return response()->json(['message' => 'Tidak bisa start job'], 422);
         }
 
@@ -375,6 +444,13 @@ class ServiceBookingApprovalController extends Controller
             'started_at' => now(),
         ]);
 
+        /*
+        |-----------------------------------------
+        | Baru di sini damage report menjadi in_progress.
+        | Karena teknisi sudah benar-benar mulai kerja.
+        */
+        $this->syncDamageReportStatus($booking, 'in_progress');
+
         $booking->refresh()->load([
             'damageReport.vehicle',
             'damageReport.driver',
@@ -393,30 +469,264 @@ class ServiceBookingApprovalController extends Controller
 
     /*
     |-----------------------------------------
+    | ADMIN REJECT BOOKING REQUEST
+    |-----------------------------------------
+    |
+    | Digunakan saat admin menolak permintaan booking dari driver.
+    | Status menjadi rejected, bukan canceled.
+    | Setelah rejected, data tidak tampil lagi di approval aktif.
+    |
+    */
+    public function reject(Request $request, ServiceBooking $booking)
+    {
+        $request->validate([
+            'note_admin' => 'nullable|string|max:1000',
+            'note' => 'nullable|string|max:1000',
+        ]);
+
+        $note = $request->note_admin
+            ?? $request->note
+            ?? 'Booking ditolak oleh admin';
+
+        if (!in_array($booking->status, ['requested', 'rescheduled'], true)) {
+            return response()->json([
+                'message' => 'Booking ini tidak bisa ditolak karena statusnya sudah berubah.',
+                'current_status' => $booking->status,
+            ], 422);
+        }
+
+        try {
+            DB::transaction(function () use ($booking, $note) {
+                $bookingTable = $booking->getTable();
+
+                $payload = [
+                    'status' => 'rejected',
+                ];
+
+                if (Schema::hasColumn($bookingTable, 'note_admin')) {
+                    $payload['note_admin'] = $note;
+                }
+
+                if (Schema::hasColumn($bookingTable, 'rejected_at')) {
+                    $payload['rejected_at'] = now();
+                }
+
+                if (Schema::hasColumn($bookingTable, 'rejected_by')) {
+                    $payload['rejected_by'] = auth()->id();
+                }
+
+                $booking->update($payload);
+
+                /*
+                |-----------------------------------------
+                | Reject booking berarti laporan juga rejected.
+                | Ini berbeda dengan approve.
+                */
+                $this->syncDamageReportStatus($booking, 'rejected', $note);
+            });
+
+            $booking->refresh()->load([
+                'damageReport.vehicle',
+                'damageReport.driver',
+                'vehicle',
+                'driver',
+                'technician',
+            ]);
+
+            $this->notify($booking, 'rejected');
+
+            return response()->json([
+                'message' => 'Booking berhasil ditolak oleh admin.',
+                'data' => $booking,
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('Reject booking error: ' . $e->getMessage(), [
+                'booking_id' => $booking->id ?? null,
+                'trace' => $e->getTraceAsString(),
+            ]);
+
+            return response()->json([
+                'message' => 'Gagal menolak booking.',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /*
+    |-----------------------------------------
     | CANCEL
     |-----------------------------------------
+    |
+    | Cancel tetap dipertahankan untuk pembatalan.
+    | Untuk admin menolak permintaan driver, gunakan method reject().
+    |
     */
     public function cancel(Request $request, ServiceBooking $booking)
     {
-        $booking->update([
-            'status' => 'canceled',
-            'note_admin' => $request->note_admin,
+        $request->validate([
+            'note_admin' => 'nullable|string|max:1000',
+            'note' => 'nullable|string|max:1000',
         ]);
 
-        $booking->refresh()->load([
-            'damageReport.vehicle',
-            'damageReport.driver',
-            'vehicle',
-            'driver',
-            'technician',
-        ]);
+        $note = $request->note_admin
+            ?? $request->note
+            ?? 'Booking dibatalkan';
 
-        $this->notify($booking, 'canceled');
+        try {
+            DB::transaction(function () use ($booking, $note) {
+                $bookingTable = $booking->getTable();
 
-        return response()->json([
-            'message' => 'Booking dibatalkan',
-            'data' => $booking,
-        ]);
+                $payload = [
+                    'status' => 'canceled',
+                ];
+
+                if (Schema::hasColumn($bookingTable, 'note_admin')) {
+                    $payload['note_admin'] = $note;
+                }
+
+                if (Schema::hasColumn($bookingTable, 'canceled_at')) {
+                    $payload['canceled_at'] = now();
+                }
+
+                if (Schema::hasColumn($bookingTable, 'canceled_by')) {
+                    $payload['canceled_by'] = auth()->id();
+                }
+
+                $booking->update($payload);
+
+                $this->syncDamageReportStatus($booking, 'canceled', $note);
+            });
+
+            $booking->refresh()->load([
+                'damageReport.vehicle',
+                'damageReport.driver',
+                'vehicle',
+                'driver',
+                'technician',
+            ]);
+
+            $this->notify($booking, 'canceled');
+
+            return response()->json([
+                'message' => 'Booking dibatalkan',
+                'data' => $booking,
+            ]);
+        } catch (\Throwable $e) {
+            Log::error('Cancel booking error: ' . $e->getMessage(), [
+                'booking_id' => $booking->id ?? null,
+                'trace' => $e->getTraceAsString(),
+            ]);
+
+            return response()->json([
+                'message' => 'Gagal membatalkan booking.',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    /*
+    |-----------------------------------------
+    | SYNC DAMAGE REPORT STATUS
+    |-----------------------------------------
+    |
+    | Fungsi ini hanya untuk menyelaraskan status laporan.
+    |
+    | Catatan penting:
+    | - Booking approved / rescheduled belum berarti teknisi mulai kerja.
+    | - Jadi damage report tetap reported / Dilaporkan.
+    | - Damage report baru in_progress saat teknisi start job.
+    |
+    */
+    private function syncDamageReportStatus(
+        ServiceBooking $booking,
+        string $status,
+        ?string $note = null
+    ): void {
+        try {
+            $booking->loadMissing('damageReport');
+
+            $damageReport = $booking->damageReport;
+
+            if (!$damageReport) {
+                return;
+            }
+
+            $damageReportTable = $damageReport->getTable();
+
+            /*
+            |-----------------------------------------
+            | Mapping status untuk damage_reports
+            |-----------------------------------------
+            */
+            $damageReportStatus = match ($status) {
+                'requested',
+                'pending',
+                'waiting',
+                'approved',
+                'scheduled',
+                'rescheduled',
+                'reported' => 'reported',
+
+                'in_progress',
+                'ongoing',
+                'proses',
+                'diproses' => 'in_progress',
+
+                'completed',
+                'finished',
+                'selesai' => 'completed',
+
+                'rejected',
+                'reject',
+                'ditolak' => 'rejected',
+
+                'canceled',
+                'cancelled',
+                'dibatalkan' => 'canceled',
+
+                default => $status,
+            };
+
+            $payload = [
+                'status' => $damageReportStatus,
+            ];
+
+            if ($note && Schema::hasColumn($damageReportTable, 'note_admin')) {
+                $payload['note_admin'] = $note;
+            }
+
+            if ($note && Schema::hasColumn($damageReportTable, 'admin_note')) {
+                $payload['admin_note'] = $note;
+            }
+
+            if ($damageReportStatus === 'rejected') {
+                if (Schema::hasColumn($damageReportTable, 'rejected_at')) {
+                    $payload['rejected_at'] = now();
+                }
+
+                if (Schema::hasColumn($damageReportTable, 'rejected_by')) {
+                    $payload['rejected_by'] = auth()->id();
+                }
+            }
+
+            if ($damageReportStatus === 'canceled') {
+                if (Schema::hasColumn($damageReportTable, 'canceled_at')) {
+                    $payload['canceled_at'] = now();
+                }
+
+                if (Schema::hasColumn($damageReportTable, 'canceled_by')) {
+                    $payload['canceled_by'] = auth()->id();
+                }
+            }
+
+            $damageReport->update($payload);
+        } catch (\Throwable $e) {
+            Log::warning('Sync damage report status error', [
+                'booking_id' => $booking->id ?? null,
+                'status' => $status,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 
     /*
@@ -444,7 +754,24 @@ class ServiceBookingApprovalController extends Controller
                     'data' => [
                         'booking_id' => $booking->id,
                         'report_id' => $report->id,
+
+                        /*
+                        |-----------------------------------------
+                        | Status booking tetap status asli service_bookings.
+                        |-----------------------------------------
+                        */
                         'status' => $booking->status,
+                        'booking_status' => $booking->status,
+                        'service_booking_status' => $booking->status,
+
+                        /*
+                        |-----------------------------------------
+                        | Status damage report bisa berbeda.
+                        | Contoh:
+                        | booking approved, damage report reported.
+                        |-----------------------------------------
+                        */
+                        'damage_report_status' => $report->status ?? null,
                     ],
                 ]);
 
@@ -471,6 +798,8 @@ class ServiceBookingApprovalController extends Controller
                     'data' => [
                         'booking_id' => $booking->id,
                         'status' => $booking->status,
+                        'booking_status' => $booking->status,
+                        'service_booking_status' => $booking->status,
                         'technician_id' => $booking->technician_id,
                     ],
                 ]);
@@ -493,7 +822,10 @@ class ServiceBookingApprovalController extends Controller
             NodeEventPublisher::publish("service_booking.{$type}", [
                 'booking_id' => $booking->id,
                 'status' => $booking->status,
+                'booking_status' => $booking->status,
+                'service_booking_status' => $booking->status,
                 'technician_id' => $booking->technician_id,
+                'damage_report_status' => $booking->damageReport?->status,
             ], ['admin', 'driver', 'technician']);
         } catch (\Throwable $e) {
             Log::warning("Node event error", [

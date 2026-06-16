@@ -230,9 +230,10 @@ Route::middleware('auth:sanctum')->group(function () {
         | Flow:
         | 1. Driver membuat booking dari damage report.
         | 2. Admin melihat booking di Maintenance Scheduling.
-        | 3. Admin memilih teknisi.
-        | 4. Booking masuk ke teknisi terpilih.
-        | 5. Teknisi start / complete job dari mobile.
+        | 3. Admin memilih teknisi dan approve booking.
+        | 4. Jika booking tidak disetujui, admin reject booking dari Maintenance Scheduling.
+        | 5. Booking masuk ke teknisi terpilih setelah approve.
+        | 6. Teknisi start / complete job dari mobile.
         |
         */
         Route::get('bookings', [AdminBookingApprovalController::class, 'index']);
@@ -251,6 +252,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
         Route::post('bookings/{booking}/approve', [AdminBookingApprovalController::class, 'approve']);
         Route::post('bookings/{booking}/reschedule', [AdminBookingApprovalController::class, 'reschedule']);
+        Route::post('bookings/{booking}/reject', [AdminBookingApprovalController::class, 'reject']);
         Route::post('bookings/{booking}/cancel', [AdminBookingApprovalController::class, 'cancel']);
     });
 

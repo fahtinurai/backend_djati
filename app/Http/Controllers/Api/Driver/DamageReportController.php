@@ -81,6 +81,7 @@ class DamageReportController extends Controller
             ->where('driver_id', $request->user()->id)
             ->with([
                 'vehicle',
+                'booking',
                 'latestTechnicianResponse.technician',
             ])
             ->latest();
@@ -91,8 +92,14 @@ class DamageReportController extends Controller
             if (in_array($status, ['menunggu', 'waiting'], true)) {
                 $q->whereDoesntHave('latestTechnicianResponse');
             } else {
-                $q->whereHas('latestTechnicianResponse', function ($r) use ($status) {
-                    $r->where('status', $status);
+                $q->where(function ($query) use ($status) {
+                    $query->whereHas('latestTechnicianResponse', function ($r) use ($status) {
+                        $r->where('status', $status);
+                    })
+                    ->orWhereHas('booking', function ($booking) use ($status) {
+                        $booking->where('status', $status);
+                    })
+                    ->orWhere('status', $status);
                 });
             }
         }
@@ -258,6 +265,7 @@ class DamageReportController extends Controller
 
         $damageReport->load([
             'vehicle',
+            'booking',
             'technicianResponses' => fn ($q) => $q->orderBy('created_at', 'asc'),
             'technicianResponses.technician',
             'latestTechnicianResponse.technician',
@@ -400,6 +408,18 @@ class DamageReportController extends Controller
         $vehicle = $report->vehicle;
         $vehicleResponse = $vehicle ? $this->vehicleResponse($vehicle) : null;
 
+        /**
+         * Booking dibaca jika relasi sudah di-load.
+         * Relasi ini dipakai agar status approval booking dari
+         * ServiceBookingApprovalController tetap bisa tampil di UI mobile driver.
+         */
+        $booking = $report->relationLoaded('booking')
+            ? $report->booking
+            : null;
+
+        $bookingStatus = $booking?->status;
+        $displayStatus = $this->resolveDriverDamageReportStatus($report, $booking);
+
         return [
             'id'          => $report->id,
             'vehicle_id'  => $report->vehicle_id,
@@ -408,7 +428,35 @@ class DamageReportController extends Controller
             'description' => $report->description,
             'image'       => $report->image,
             'image_url'   => $this->imageUrl($report->image),
-            'status'      => $report->status ?? null,
+
+            /**
+             * Status utama untuk UI mobile driver.
+             * Jika booking service ditolak dari Approval Booking,
+             * status akan ikut menjadi rejected walaupun proses reject
+             * berasal dari ServiceBookingApprovalController.
+             */
+            'status'      => $displayStatus,
+
+            /**
+             * Status asli laporan kerusakan.
+             */
+            'damage_report_status' => $report->status ?? null,
+
+            /**
+             * Status booking service.
+             * Field ini penting agar UI mobile dapat membaca status booking
+             * secara langsung dari service_bookings.
+             */
+            'booking_status' => $bookingStatus,
+            'service_booking_status' => $bookingStatus,
+            'booking_id' => $booking?->id,
+            'service_booking_id' => $booking?->id,
+            'booking_note_admin' => $booking?->note_admin,
+            'booking_note_driver' => $booking?->note_driver,
+            'booking_preferred_at' => $booking?->preferred_at,
+            'booking_scheduled_at' => $booking?->scheduled_at,
+            'booking_rejected_at' => $booking?->rejected_at ?? null,
+
             'created_at'  => $report->created_at,
             'updated_at'  => $report->updated_at,
 
@@ -436,6 +484,59 @@ class DamageReportController extends Controller
             'latest_technician_response' => $report->latestTechnicianResponse ?? null,
             'technician_responses'       => $report->technicianResponses ?? null,
         ];
+    }
+
+    /**
+     * Tentukan status utama yang akan dibaca UI mobile driver.
+     *
+     * Prioritas:
+     * 1. Status booking service, karena approve/reject booking berasal dari
+     *    ServiceBookingApprovalController.
+     * 2. Status damage report sebagai fallback dan riwayat laporan.
+     * 3. menunggu jika belum ada status.
+     */
+    private function resolveDriverDamageReportStatus(DamageReport $report, $booking = null): ?string
+    {
+        $bookingStatus = $booking?->status;
+
+        if ($bookingStatus) {
+            $normalizedBookingStatus = strtolower(trim((string) $bookingStatus));
+            $normalizedBookingStatus = str_replace([' ', '-'], '_', $normalizedBookingStatus);
+
+            if (in_array($normalizedBookingStatus, [
+                'requested',
+                'pending',
+                'waiting',
+                'approved',
+                'scheduled',
+                'rescheduled',
+                'in_progress',
+                'completed',
+                'finished',
+                'selesai',
+                'rejected',
+                'reject',
+                'ditolak',
+                'canceled',
+                'cancelled',
+                'dibatalkan',
+            ], true)) {
+                return match ($normalizedBookingStatus) {
+                    'pending', 'waiting' => 'requested',
+                    'scheduled' => 'approved',
+                    'finished', 'selesai' => 'completed',
+                    'reject', 'ditolak' => 'rejected',
+                    'cancelled', 'dibatalkan' => 'canceled',
+                    default => $normalizedBookingStatus,
+                };
+            }
+        }
+
+        if ($report->status) {
+            return $report->status;
+        }
+
+        return 'menunggu';
     }
 
     /**

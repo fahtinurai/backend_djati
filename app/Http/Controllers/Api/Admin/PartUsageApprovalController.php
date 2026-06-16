@@ -10,6 +10,7 @@ use App\Models\FinanceTransaction;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use App\Services\NodeEventPublisher;
+use Carbon\Carbon;
 
 class PartUsageApprovalController extends Controller
 {
@@ -82,6 +83,13 @@ class PartUsageApprovalController extends Controller
             $part = Part::lockForUpdate()->findOrFail($partUsage->part_id);
             $qty  = (int) $partUsage->qty;
 
+            /**
+             * Tanggal approval dibuat berdasarkan timezone Indonesia.
+             * Dipakai untuk StockMovement dan FinanceTransaction
+             * agar tanggal pengeluaran tidak bergeser karena timezone server/UTC.
+             */
+            $approvalDate = Carbon::now('Asia/Jakarta')->toDateString();
+
             if ($qty < 1) {
                 return response()->json(['message' => 'Qty tidak valid'], 400);
             }
@@ -89,6 +97,19 @@ class PartUsageApprovalController extends Controller
             if ($part->stock < $qty) {
                 return response()->json(['message' => 'Stok tidak mencukupi'], 400);
             }
+
+            // =============================
+            // VALIDASI HARGA BELI SPAREPART
+            // =============================
+            $unitPrice = (float) ($part->buy_price ?? 0);
+
+            if ($unitPrice <= 0) {
+                return response()->json([
+                    'message' => 'Harga beli sparepart belum diisi. Isi harga beli dulu agar pengeluaran otomatis masuk ke finance.'
+                ], 422);
+            }
+
+            $totalCost = $unitPrice * $qty;
 
             // =============================
             // 1️⃣ KURANGI STOK
@@ -103,7 +124,7 @@ class PartUsageApprovalController extends Controller
                 'part_id' => $part->id,
                 'type'    => 'OUT',
                 'qty'     => $qty,
-                'date'    => now()->toDateString(),
+                'date'    => $approvalDate,
                 'note'    => $data['admin_note']
                     ?? 'Pemakaian teknisi ID: ' . $partUsage->technician_id,
                 'ref'     => 'damage_report:' . $partUsage->damage_report_id,
@@ -112,20 +133,20 @@ class PartUsageApprovalController extends Controller
             // =============================
             // 3️⃣ FINANCE EXPENSE (INVENTORY)
             // =============================
-            $totalCost = ((float) ($part->buy_price ?? 0)) * $qty;
-
-            if ($totalCost > 0) {
-                FinanceTransaction::create([
+            $financeTransaction = FinanceTransaction::updateOrCreate(
+                [
+                    'source' => 'inventory',
+                    'ref'    => (string) $partUsage->id,
+                ],
+                [
                     'type'     => 'expense',
                     'category' => 'Inventory',
                     'amount'   => $totalCost,
-                    'date'     => now(),
+                    'date'     => $approvalDate,
                     'note'     => 'Pengeluaran sparepart (request teknisi #' . $partUsage->id . ')',
-                    'source'   => 'inventory',
-                    'ref'      => $partUsage->id,
                     'locked'   => true,
-                ]);
-            }
+                ]
+            );
 
             // =============================
             // 4️⃣ UPDATE STATUS REQUEST
@@ -159,21 +180,25 @@ class PartUsageApprovalController extends Controller
                 'stock_after'      => $part->stock,
                 'movement_id'      => $movement->id,
                 'expense'          => $totalCost,
+                'date'             => $approvalDate,
             ], ['admin']);
 
             NodeEventPublisher::publish('inventory.expense.created', [
-                'part_usage_id' => $partUsage->id,
-                'amount'        => $totalCost,
-                'qty'           => $qty,
-                'part_id'       => $part->id,
+                'part_usage_id'          => $partUsage->id,
+                'finance_transaction_id' => $financeTransaction->id,
+                'amount'                 => $totalCost,
+                'qty'                    => $qty,
+                'part_id'                => $part->id,
+                'date'                   => $approvalDate,
             ], ['admin']);
 
             return response()->json([
-                'message'  => 'Approved. Stok & expense tercatat.',
-                'usage'    => $partUsage,
-                'part'     => $part,
-                'movement' => $movement,
-                'expense'  => $totalCost,
+                'message'             => 'Approved. Stok & expense tercatat.',
+                'usage'               => $partUsage,
+                'part'                => $part,
+                'movement'            => $movement,
+                'expense'             => $totalCost,
+                'finance_transaction' => $financeTransaction,
             ]);
         });
     }
