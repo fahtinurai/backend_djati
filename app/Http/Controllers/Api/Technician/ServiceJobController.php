@@ -14,26 +14,28 @@ class ServiceJobController extends Controller
 {
     /**
      * List job untuk teknisi:
-     * - queue  : approved, scheduled, rescheduled
-     * - active : approved, scheduled, rescheduled, in_progress
-     * - all    : semua job milik teknisi, kecuali requested/canceled/rejected
+     * - queue     : approved, scheduled, rescheduled
+     * - active    : approved, scheduled, rescheduled, in_progress
+     * - completed : completed, finished, selesai
+     * - all       : semua job milik teknisi, kecuali requested/canceled/rejected
      *
      * PENTING:
      * Teknisi hanya boleh melihat job yang sudah dipilih admin.
      * Jadi technician_id wajib sama dengan teknisi login.
+     *
+     * Penyesuaian:
+     * - Response sekarang membawa damage_report.part_usages
+     * - Teknisi bisa melihat progress request sparepart:
+     *   requested / approved / rejected
      */
     public function index(Request $request)
     {
         $status = $request->query('status', 'active');
         $technician = $request->user();
 
-        $q = ServiceBooking::with([
-                'damageReport.vehicle',
-                'damageReport.driver',
-                'vehicle',
-                'driver',
-                'technician',
-            ])
+        $q = ServiceBooking::with(
+                $this->jobRelations((int) $technician->id)
+            )
             ->where('technician_id', $technician->id)
             ->whereNotIn('status', [
                 'requested',
@@ -84,17 +86,20 @@ class ServiceJobController extends Controller
         return response()->json($q->get());
     }
 
+    /**
+     * Detail job teknisi.
+     *
+     * Penyesuaian:
+     * - Detail job ikut membawa damage_report.part_usages
+     * - Dari sini Flutter bisa menampilkan progress permintaan sparepart
+     */
     public function show(Request $request, ServiceBooking $booking)
     {
         $this->authorizeTechnicianAccess($request, $booking);
 
-        $booking->load([
-            'damageReport.vehicle',
-            'damageReport.driver',
-            'vehicle',
-            'driver',
-            'technician',
-        ]);
+        $booking->load(
+            $this->jobRelations((int) $request->user()->id)
+        );
 
         return response()->json($booking);
     }
@@ -113,13 +118,9 @@ class ServiceJobController extends Controller
             'note_technician' => 'nullable|string|max:1000',
         ]);
 
-        $booking->load([
-            'damageReport.vehicle',
-            'damageReport.driver',
-            'vehicle',
-            'driver',
-            'technician',
-        ]);
+        $booking->load(
+            $this->jobRelations((int) $request->user()->id)
+        );
 
         if (!in_array($booking->status, ['approved', 'scheduled', 'rescheduled'], true)) {
             return response()->json([
@@ -141,13 +142,9 @@ class ServiceJobController extends Controller
 
         $booking->forceFill($payload)->save();
 
-        $booking->refresh()->load([
-            'damageReport.vehicle',
-            'damageReport.driver',
-            'vehicle',
-            'driver',
-            'technician',
-        ]);
+        $booking->refresh()->load(
+            $this->jobRelations((int) $request->user()->id)
+        );
 
         $startedIso = $this->hasColumn($booking, 'started_at')
             ? optional($booking->started_at)->toISOString()
@@ -155,11 +152,16 @@ class ServiceJobController extends Controller
 
         $updatedIso = optional($booking->updated_at)->toISOString();
 
+        /*
+        |--------------------------------------------------------------------------
+        | FCM DRIVER
+        |--------------------------------------------------------------------------
+        */
         try {
             $fcm = app(\App\Services\FcmService::class);
 
             $report = $booking->damageReport;
-            $driver = $report?->driver;
+            $driver = $report?->driver ?? $booking?->driver;
             $plate = $report?->vehicle?->plate_number
                 ?? $booking?->vehicle?->plate_number
                 ?? '-';
@@ -186,6 +188,11 @@ class ServiceJobController extends Controller
             ]);
         }
 
+        /*
+        |--------------------------------------------------------------------------
+        | NODE EVENT
+        |--------------------------------------------------------------------------
+        */
         try {
             NodeEventPublisher::publish('service_job.started', [
                 'booking_id' => (int) $booking->id,
@@ -196,6 +203,14 @@ class ServiceJobController extends Controller
                 'status' => (string) $booking->status,
                 'started_at' => $startedIso,
                 'updated_at' => $updatedIso,
+
+                /*
+                |--------------------------------------------------------------------------
+                | Info sparepart untuk sinkronisasi UI teknisi
+                |--------------------------------------------------------------------------
+                */
+                'part_usage_summary' => $booking->damageReport?->part_usage_summary ?? null,
+                'has_rejected_part_usage' => $booking->damageReport?->has_rejected_part_usage ?? false,
             ], ['admin', 'technician', 'driver']);
         } catch (\Throwable $e) {
             Log::warning('Gagal publish node event service_job.started', [
@@ -214,7 +229,7 @@ class ServiceJobController extends Controller
      * Teknisi selesai kerja.
      *
      * PENTING:
-     * Flutter sekarang mengirim data mentah:
+     * Flutter mengirim data mentah:
      * - final_hour_meter
      * - current_hour_meter
      * - latest_hour_meter
@@ -228,6 +243,10 @@ class ServiceJobController extends Controller
      * - mttr
      * - mtbf
      * - ma
+     *
+     * Penyesuaian:
+     * - Response tetap membawa damage_report.part_usages
+     * - Jika ada sparepart rejected, teknisi tetap bisa melihat riwayatnya
      */
     public function complete(Request $request, ServiceBooking $booking)
     {
@@ -267,23 +286,15 @@ class ServiceJobController extends Controller
             |--------------------------------------------------------------------------
             | FIELD LAMA
             |--------------------------------------------------------------------------
-            |
-            | Tetap diterima untuk kompatibilitas, tapi flow baru sebaiknya
-            | menghitung dari data mentah di backend.
-            |
             */
             'mttr' => 'nullable|numeric|min:0',
             'mtbf' => 'nullable|numeric|min:0',
             'ma' => 'nullable|numeric|min:0|max:100',
         ]);
 
-        $booking->load([
-            'damageReport.vehicle',
-            'damageReport.driver',
-            'vehicle',
-            'driver',
-            'technician',
-        ]);
+        $booking->load(
+            $this->jobRelations((int) $request->user()->id)
+        );
 
         if (!in_array($booking->status, ['in_progress'], true)) {
             return response()->json([
@@ -588,13 +599,9 @@ class ServiceJobController extends Controller
             }
         });
 
-        $booking->refresh()->load([
-            'damageReport.vehicle',
-            'damageReport.driver',
-            'vehicle',
-            'driver',
-            'technician',
-        ]);
+        $booking->refresh()->load(
+            $this->jobRelations((int) $request->user()->id)
+        );
 
         $completedIso = $this->hasColumn($booking, 'completed_at')
             ? optional($booking->completed_at)->toISOString()
@@ -667,6 +674,15 @@ class ServiceJobController extends Controller
                 'mttr' => $booking->mttr ?? null,
                 'mtbf' => $booking->mtbf ?? null,
                 'ma' => $booking->ma ?? null,
+
+                /*
+                |--------------------------------------------------------------------------
+                | Info sparepart untuk UI teknisi
+                |--------------------------------------------------------------------------
+                */
+                'part_usage_summary' => $booking->damageReport?->part_usage_summary ?? null,
+                'has_rejected_part_usage' => $booking->damageReport?->has_rejected_part_usage ?? false,
+                'latest_rejected_part_usage_note' => $booking->damageReport?->latest_rejected_part_usage_note ?? null,
             ], ['admin', 'technician', 'driver']);
         } catch (\Throwable $e) {
             Log::warning('Gagal publish node event service_job.completed', [
@@ -679,6 +695,55 @@ class ServiceJobController extends Controller
             'message' => 'Job selesai',
             'data' => $booking,
         ]);
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | JOB RELATIONS
+    |--------------------------------------------------------------------------
+    |
+    | Relasi utama untuk response teknisi.
+    |
+    | PENTING:
+    | - damageReport.partUsages di-load agar UI teknisi bisa melihat
+    |   progress permintaan sparepart.
+    | - Filter technician_id agar teknisi hanya melihat request sparepart
+    |   yang dibuat oleh dirinya sendiri.
+    |
+    | Response Laravel:
+    | damageReport.partUsages akan menjadi:
+    | damage_report.part_usages
+    |
+    */
+    private function jobRelations(int $technicianId): array
+    {
+        return [
+            'damageReport.vehicle',
+            'damageReport.driver',
+            'vehicle',
+            'driver',
+            'technician',
+
+            'damageReport.partUsages' => function ($q) use ($technicianId) {
+                $q->select([
+                        'id',
+                        'technician_id',
+                        'part_id',
+                        'damage_report_id',
+                        'qty',
+                        'status',
+                        'note',
+                        'created_at',
+                        'updated_at',
+                    ])
+                    ->where('technician_id', $technicianId)
+                    ->with([
+                        'part:id,name,sku,stock',
+                        'technician:id,username,role',
+                    ])
+                    ->orderBy('created_at', 'desc');
+            },
+        ];
     }
 
     /**

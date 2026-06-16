@@ -41,8 +41,10 @@ class DamageReport extends Model
     | Penyesuaian:
     | - image_url tetap untuk akses gambar
     | - computed_status tetap untuk status laporan
-    | - vehicle_initial_hour_meter ditambahkan agar aman untuk frontend/mobile
-    |   yang sudah memakai istilah Hour Meter Awal
+    | - responsible_technician_id untuk mengetahui teknisi yang bertanggung jawab
+    | - part_usage_summary untuk membantu mobile mengetahui progress sparepart
+    | - has_rejected_part_usage untuk menandai apakah ada request sparepart ditolak
+    | - latest_rejected_part_usage_note untuk menampilkan alasan penolakan terbaru
     |
     */
     protected $appends = [
@@ -50,6 +52,15 @@ class DamageReport extends Model
         'computed_status',
         'computed_status_label',
         'responsible_technician_id',
+
+        /*
+        |--------------------------------------------------------------------------
+        | INFO REQUEST SPAREPART UNTUK TEKNISI
+        |--------------------------------------------------------------------------
+        */
+        'part_usage_summary',
+        'has_rejected_part_usage',
+        'latest_rejected_part_usage_note',
 
         /*
         |--------------------------------------------------------------------------
@@ -132,35 +143,181 @@ class DamageReport extends Model
 
     /*
     |--------------------------------------------------------------------------
-    | SPARE PART USAGE RELATIONS
+    | SPAREPART USAGE RELATIONS
     |--------------------------------------------------------------------------
+    |
+    | PENTING:
+    | Flow baru request sparepart memakai model TechnicianPartUsage.
+    |
+    | Jadi relasi ini sengaja diarahkan ke TechnicianPartUsage,
+    | bukan PartUsage, supaya data yang dibuat teknisi dan diproses admin
+    | bisa terbaca kembali di sisi teknisi.
+    |
+    | Response Laravel:
+    | - partUsages() akan menjadi part_usages
+    |
+    | Data inilah yang nanti dibaca Flutter:
+    | - requested / pending  = menunggu approval admin
+    | - approved             = disetujui admin
+    | - rejected             = ditolak admin
+    |
     */
 
     public function partUsages()
     {
-        return $this->hasMany(PartUsage::class, 'damage_report_id', 'id')
+        return $this->hasMany(TechnicianPartUsage::class, 'damage_report_id', 'id')
+            ->with([
+                'part:id,name,sku,stock,buy_price',
+                'technician:id,username,role',
+            ])
             ->orderBy('created_at', 'desc');
     }
 
     public function pendingPartUsages()
     {
-        return $this->hasMany(PartUsage::class, 'damage_report_id', 'id')
+        return $this->hasMany(TechnicianPartUsage::class, 'damage_report_id', 'id')
             ->whereIn('status', ['pending', 'requested'])
+            ->with([
+                'part:id,name,sku,stock,buy_price',
+                'technician:id,username,role',
+            ])
             ->orderBy('created_at', 'desc');
     }
 
     public function approvedPartUsages()
     {
-        return $this->hasMany(PartUsage::class, 'damage_report_id', 'id')
+        return $this->hasMany(TechnicianPartUsage::class, 'damage_report_id', 'id')
             ->where('status', 'approved')
+            ->with([
+                'part:id,name,sku,stock,buy_price',
+                'technician:id,username,role',
+            ])
             ->orderBy('created_at', 'desc');
     }
 
     public function rejectedPartUsages()
     {
-        return $this->hasMany(PartUsage::class, 'damage_report_id', 'id')
+        return $this->hasMany(TechnicianPartUsage::class, 'damage_report_id', 'id')
             ->where('status', 'rejected')
+            ->with([
+                'part:id,name,sku,stock,buy_price',
+                'technician:id,username,role',
+            ])
             ->orderBy('created_at', 'desc');
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | SPAREPART USAGE ACCESSORS
+    |--------------------------------------------------------------------------
+    |
+    | Accessor ini membantu frontend/mobile membaca ringkasan request sparepart.
+    | Misalnya teknisi bisa tahu ada request yang ditolak tanpa harus menghitung
+    | manual satu per satu di Flutter.
+    |
+    */
+
+    private function resolvedPartUsages()
+    {
+        if ($this->relationLoaded('partUsages')) {
+            return $this->partUsages;
+        }
+
+        return $this->partUsages()->get();
+    }
+
+    private function normalizePartUsageStatus(?string $status): string
+    {
+        if (empty($status)) {
+            return 'requested';
+        }
+
+        $status = strtolower(trim($status));
+        $status = str_replace([' ', '-'], '_', $status);
+
+        return match ($status) {
+            'pending',
+            'requested',
+            'menunggu' => 'requested',
+
+            'approve',
+            'approved',
+            'disetujui' => 'approved',
+
+            'reject',
+            'rejected',
+            'ditolak' => 'rejected',
+
+            default => $status,
+        };
+    }
+
+    private function cleanAdminPartUsageNote(?string $note): ?string
+    {
+        if (empty($note)) {
+            return null;
+        }
+
+        $note = str_replace('[ADMIN-REJECT]', '', $note);
+        $note = str_replace('[ADMIN]', '', $note);
+
+        $note = trim($note);
+
+        return $note !== '' ? $note : null;
+    }
+
+    public function getPartUsageSummaryAttribute(): array
+    {
+        $usages = $this->resolvedPartUsages();
+
+        $summary = [
+            'total' => 0,
+            'requested' => 0,
+            'approved' => 0,
+            'rejected' => 0,
+        ];
+
+        foreach ($usages as $usage) {
+            $summary['total']++;
+
+            $status = $this->normalizePartUsageStatus($usage->status ?? null);
+
+            if ($status === 'approved') {
+                $summary['approved']++;
+            } elseif ($status === 'rejected') {
+                $summary['rejected']++;
+            } else {
+                $summary['requested']++;
+            }
+        }
+
+        return $summary;
+    }
+
+    public function getHasRejectedPartUsageAttribute(): bool
+    {
+        $usages = $this->resolvedPartUsages();
+
+        foreach ($usages as $usage) {
+            if ($this->normalizePartUsageStatus($usage->status ?? null) === 'rejected') {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public function getLatestRejectedPartUsageNoteAttribute(): ?string
+    {
+        $usages = $this->resolvedPartUsages();
+
+        foreach ($usages as $usage) {
+            if ($this->normalizePartUsageStatus($usage->status ?? null) === 'rejected') {
+                return $this->cleanAdminPartUsageNote($usage->note ?? null);
+            }
+        }
+
+        return null;
     }
 
     /*

@@ -9,14 +9,21 @@ use App\Models\TechnicianPartUsage;
 use App\Models\FinanceTransaction;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use App\Services\NodeEventPublisher;
 use Carbon\Carbon;
 
 class PartUsageApprovalController extends Controller
 {
     /**
-     * Admin list request sparepart
-     * GET /api/admin/part-usages?status=pending|approved|rejected&limit=xx
+     * Admin list request sparepart.
+     *
+     * GET /api/admin/part-usages?status=pending|requested|approved|rejected&limit=xx
+     *
+     * Catatan:
+     * - Frontend boleh pakai pending
+     * - Database flow baru memakai requested
+     * - Untuk aman, pending dan requested tetap dibaca sebagai request aktif
      */
     public function index(Request $request)
     {
@@ -25,24 +32,24 @@ class PartUsageApprovalController extends Controller
 
         $status = $request->query('status');
 
-        // mapping frontend -> database
-        $map = [
-            'pending'   => 'requested',
-            'requested' => 'requested',
-            'approved'  => 'approved',
-            'rejected'  => 'rejected',
-        ];
-
         $q = TechnicianPartUsage::with([
                 'technician:id,username,role',
                 'part:id,name,sku,stock,buy_price',
                 'damageReport:id,vehicle_id,driver_id,description,created_at',
-                'damageReport.vehicle:id,plate_number,brand,model',
+                'damageReport.vehicle:id,plate_number,brand,model,equipment_name,serial_number',
             ])
             ->orderBy('created_at', 'desc');
 
         if ($status) {
-            $q->where('status', $map[$status] ?? $status);
+            $status = strtolower(trim((string) $status));
+
+            if (in_array($status, ['pending', 'requested'], true)) {
+                $q->whereIn('status', ['pending', 'requested']);
+            } elseif (in_array($status, ['approved', 'rejected'], true)) {
+                $q->where('status', $status);
+            } else {
+                $q->where('status', $status);
+            }
         }
 
         return response()->json(
@@ -51,7 +58,8 @@ class PartUsageApprovalController extends Controller
     }
 
     /**
-     * Admin list pending sparepart usage
+     * Admin list pending/requested sparepart usage.
+     *
      * GET /api/admin/part-usages/pending
      */
     public function pending(Request $request)
@@ -64,62 +72,99 @@ class PartUsageApprovalController extends Controller
     }
 
     /**
-     * Admin approve request sparepart
+     * Admin approve request sparepart.
+     *
      * POST /api/admin/part-usages/{partUsage}/approve
+     *
+     * Logika:
+     * - Request dari teknisi status awal: requested / pending
+     * - Admin approve
+     * - Stok sparepart berkurang
+     * - Stock movement OUT tercatat
+     * - Finance expense otomatis tercatat
+     * - Event dikirim ke admin dan teknisi
      */
     public function approve(Request $request, TechnicianPartUsage $partUsage)
     {
-        if ($partUsage->status !== 'requested') {
-            return response()->json(['message' => 'Request sudah diproses'], 400);
-        }
-
         $data = $request->validate([
             'admin_note' => 'nullable|string',
         ]);
 
         return DB::transaction(function () use ($partUsage, $data) {
+            /*
+            |--------------------------------------------------------------------------
+            | LOCK REQUEST AGAR TIDAK DIPROSES DOBEL
+            |--------------------------------------------------------------------------
+            */
+            $partUsage = TechnicianPartUsage::lockForUpdate()
+                ->findOrFail($partUsage->id);
 
+            if (!in_array($partUsage->status, ['requested', 'pending'], true)) {
+                return response()->json([
+                    'message' => 'Request sudah diproses',
+                ], 400);
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | LOCK PART AGAR STOK AMAN
+            |--------------------------------------------------------------------------
+            */
             /** @var Part $part */
             $part = Part::lockForUpdate()->findOrFail($partUsage->part_id);
-            $qty  = (int) $partUsage->qty;
+            $qty = (int) $partUsage->qty;
 
-            /**
-             * Tanggal approval dibuat berdasarkan timezone Indonesia.
-             * Dipakai untuk StockMovement dan FinanceTransaction
-             * agar tanggal pengeluaran tidak bergeser karena timezone server/UTC.
-             */
+            /*
+            |--------------------------------------------------------------------------
+            | TANGGAL APPROVAL BERDASARKAN TIMEZONE INDONESIA
+            |--------------------------------------------------------------------------
+            */
             $approvalDate = Carbon::now('Asia/Jakarta')->toDateString();
 
             if ($qty < 1) {
-                return response()->json(['message' => 'Qty tidak valid'], 400);
+                return response()->json([
+                    'message' => 'Qty tidak valid',
+                ], 400);
             }
 
             if ($part->stock < $qty) {
-                return response()->json(['message' => 'Stok tidak mencukupi'], 400);
+                return response()->json([
+                    'message' => 'Stok tidak mencukupi',
+                ], 400);
             }
 
-            // =============================
-            // VALIDASI HARGA BELI SPAREPART
-            // =============================
+            /*
+            |--------------------------------------------------------------------------
+            | VALIDASI HARGA BELI SPAREPART
+            |--------------------------------------------------------------------------
+            |
+            | Expense finance dibuat dari harga beli sparepart.
+            | Jika harga belum diisi, admin harus melengkapi dulu.
+            |
+            */
             $unitPrice = (float) ($part->buy_price ?? 0);
 
             if ($unitPrice <= 0) {
                 return response()->json([
-                    'message' => 'Harga beli sparepart belum diisi. Isi harga beli dulu agar pengeluaran otomatis masuk ke finance.'
+                    'message' => 'Harga beli sparepart belum diisi. Isi harga beli dulu agar pengeluaran otomatis masuk ke finance.',
                 ], 422);
             }
 
             $totalCost = $unitPrice * $qty;
 
-            // =============================
-            // 1️⃣ KURANGI STOK
-            // =============================
+            /*
+            |--------------------------------------------------------------------------
+            | 1. KURANGI STOK
+            |--------------------------------------------------------------------------
+            */
             $part->stock -= $qty;
             $part->save();
 
-            // =============================
-            // 2️⃣ STOCK MOVEMENT (OUT)
-            // =============================
+            /*
+            |--------------------------------------------------------------------------
+            | 2. STOCK MOVEMENT OUT
+            |--------------------------------------------------------------------------
+            */
             $movement = StockMovement::create([
                 'part_id' => $part->id,
                 'type'    => 'OUT',
@@ -130,9 +175,11 @@ class PartUsageApprovalController extends Controller
                 'ref'     => 'damage_report:' . $partUsage->damage_report_id,
             ]);
 
-            // =============================
-            // 3️⃣ FINANCE EXPENSE (INVENTORY)
-            // =============================
+            /*
+            |--------------------------------------------------------------------------
+            | 3. FINANCE EXPENSE INVENTORY
+            |--------------------------------------------------------------------------
+            */
             $financeTransaction = FinanceTransaction::updateOrCreate(
                 [
                     'source' => 'inventory',
@@ -148,49 +195,88 @@ class PartUsageApprovalController extends Controller
                 ]
             );
 
-            // =============================
-            // 4️⃣ UPDATE STATUS REQUEST
-            // =============================
+            /*
+            |--------------------------------------------------------------------------
+            | 4. UPDATE STATUS REQUEST SPAREPART
+            |--------------------------------------------------------------------------
+            */
             $partUsage->status = 'approved';
 
             if (!empty($data['admin_note'])) {
-                $old = trim((string) $partUsage->note);
-                $partUsage->note = $old
-                    ? $old . "\n[ADMIN] " . trim($data['admin_note'])
-                    : "[ADMIN] " . trim($data['admin_note']);
+                $partUsage->note = $this->appendAdminNote(
+                    $partUsage->note,
+                    'ADMIN',
+                    $data['admin_note']
+                );
             }
 
             $partUsage->save();
 
+            /*
+            |--------------------------------------------------------------------------
+            | LOAD RELASI UNTUK RESPONSE DAN EVENT
+            |--------------------------------------------------------------------------
+            */
             $partUsage->load([
                 'technician:id,username,role',
                 'part:id,name,sku,stock,buy_price',
-                'damageReport.vehicle:id,plate_number,brand,model',
+                'damageReport:id,vehicle_id,driver_id,description,created_at',
+                'damageReport.vehicle:id,plate_number,brand,model,equipment_name,serial_number',
             ]);
 
-            // =============================
-            // 5️⃣ REALTIME SOCKET EVENTS
-            // =============================
-            NodeEventPublisher::publish('part_usage.approved', [
-                'part_usage_id'    => $partUsage->id,
-                'status'           => 'approved',
-                'qty'              => $qty,
-                'part_id'          => $part->id,
-                'damage_report_id' => $partUsage->damage_report_id,
-                'stock_after'      => $part->stock,
-                'movement_id'      => $movement->id,
-                'expense'          => $totalCost,
-                'date'             => $approvalDate,
-            ], ['admin']);
-
-            NodeEventPublisher::publish('inventory.expense.created', [
-                'part_usage_id'          => $partUsage->id,
+            $eventPayload = $this->buildPartUsageEventPayload($partUsage, [
+                'status' => 'approved',
+                'movement_id' => $movement->id,
                 'finance_transaction_id' => $financeTransaction->id,
-                'amount'                 => $totalCost,
-                'qty'                    => $qty,
-                'part_id'                => $part->id,
-                'date'                   => $approvalDate,
-            ], ['admin']);
+                'expense' => $totalCost,
+                'date' => $approvalDate,
+                'stock_after' => $part->stock,
+            ]);
+
+            /*
+            |--------------------------------------------------------------------------
+            | 5. REALTIME EVENT SETELAH DATABASE COMMIT
+            |--------------------------------------------------------------------------
+            |
+            | part_usage.approved dikirim ke admin dan teknisi.
+            | inventory.expense.created cukup untuk admin.
+            |
+            */
+            DB::afterCommit(function () use (
+                $eventPayload,
+                $financeTransaction,
+                $partUsage,
+                $totalCost,
+                $qty,
+                $part,
+                $approvalDate
+            ) {
+                $this->publishNodeEvent(
+                    'part_usage.approved',
+                    $eventPayload,
+                    ['admin', 'technician']
+                );
+
+                $this->publishNodeEvent(
+                    'inventory.expense.created',
+                    [
+                        'part_usage_id'          => (int) $partUsage->id,
+                        'finance_transaction_id' => (int) $financeTransaction->id,
+                        'amount'                 => $totalCost,
+                        'qty'                    => $qty,
+                        'part_id'                => (int) $part->id,
+                        'date'                   => $approvalDate,
+                    ],
+                    ['admin']
+                );
+
+                $this->notifyTechnicianViaFcm(
+                    $partUsage,
+                    'Request Sparepart Disetujui',
+                    'Permintaan sparepart ' . ($partUsage->part?->name ?? '-') . ' telah disetujui admin.',
+                    'approved'
+                );
+            });
 
             return response()->json([
                 'message'             => 'Approved. Stok & expense tercatat.',
@@ -204,40 +290,262 @@ class PartUsageApprovalController extends Controller
     }
 
     /**
-     * Admin reject request sparepart
+     * Admin reject request sparepart.
+     *
      * POST /api/admin/part-usages/{partUsage}/reject
+     *
+     * Logika:
+     * - Admin menolak request sparepart
+     * - Status menjadi rejected
+     * - Alasan penolakan masuk ke note
+     * - Event dikirim ke admin dan teknisi
+     * - Teknisi dapat membaca status rejected dari:
+     *   damage_report.part_usages
      */
     public function reject(Request $request, TechnicianPartUsage $partUsage)
     {
-        if ($partUsage->status !== 'requested') {
-            return response()->json(['message' => 'Request sudah diproses'], 400);
-        }
-
         $data = $request->validate([
             'reason' => 'nullable|string',
         ]);
 
-        $partUsage->status = 'rejected';
+        return DB::transaction(function () use ($partUsage, $data) {
+            /*
+            |--------------------------------------------------------------------------
+            | LOCK REQUEST AGAR TIDAK DIPROSES DOBEL
+            |--------------------------------------------------------------------------
+            */
+            $partUsage = TechnicianPartUsage::lockForUpdate()
+                ->findOrFail($partUsage->id);
 
-        if (!empty($data['reason'])) {
-            $old = trim((string) $partUsage->note);
-            $partUsage->note = $old
-                ? $old . "\n[ADMIN-REJECT] " . trim($data['reason'])
-                : "[ADMIN-REJECT] " . trim($data['reason']);
+            if (!in_array($partUsage->status, ['requested', 'pending'], true)) {
+                return response()->json([
+                    'message' => 'Request sudah diproses',
+                ], 400);
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | UPDATE STATUS MENJADI REJECTED
+            |--------------------------------------------------------------------------
+            */
+            $partUsage->status = 'rejected';
+
+            if (!empty($data['reason'])) {
+                $partUsage->note = $this->appendAdminNote(
+                    $partUsage->note,
+                    'ADMIN-REJECT',
+                    $data['reason']
+                );
+            }
+
+            $partUsage->save();
+
+            /*
+            |--------------------------------------------------------------------------
+            | LOAD RELASI UNTUK RESPONSE DAN EVENT
+            |--------------------------------------------------------------------------
+            */
+            $partUsage->load([
+                'technician:id,username,role',
+                'part:id,name,sku,stock,buy_price',
+                'damageReport:id,vehicle_id,driver_id,description,created_at',
+                'damageReport.vehicle:id,plate_number,brand,model,equipment_name,serial_number',
+            ]);
+
+            $eventPayload = $this->buildPartUsageEventPayload($partUsage, [
+                'status' => 'rejected',
+                'reason' => $data['reason'] ?? null,
+                'rejected_at' => optional($partUsage->updated_at)->toISOString(),
+            ]);
+
+            /*
+            |--------------------------------------------------------------------------
+            | REALTIME EVENT SETELAH DATABASE COMMIT
+            |--------------------------------------------------------------------------
+            |
+            | Event dikirim ke admin dan teknisi.
+            | Dengan ini UI teknisi bisa tahu request sparepart ditolak.
+            |
+            */
+            DB::afterCommit(function () use ($eventPayload, $partUsage, $data) {
+                $this->publishNodeEvent(
+                    'part_usage.rejected',
+                    $eventPayload,
+                    ['admin', 'technician']
+                );
+
+                $this->notifyTechnicianViaFcm(
+                    $partUsage,
+                    'Request Sparepart Ditolak',
+                    'Permintaan sparepart ' . ($partUsage->part?->name ?? '-') . ' ditolak admin.',
+                    'rejected',
+                    $data['reason'] ?? null
+                );
+            });
+
+            return response()->json([
+                'message' => 'Request ditolak.',
+                'usage'   => $partUsage,
+            ]);
+        });
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | HELPER: APPEND ADMIN NOTE
+    |--------------------------------------------------------------------------
+    |
+    | Format note:
+    | [ADMIN] catatan approve
+    | [ADMIN-REJECT] alasan reject
+    |
+    */
+    private function appendAdminNote(?string $oldNote, string $tag, ?string $newNote): string
+    {
+        $old = trim((string) $oldNote);
+        $new = trim((string) $newNote);
+
+        if ($new === '') {
+            return $old;
         }
 
-        $partUsage->save();
+        $line = '[' . $tag . '] ' . $new;
 
-        NodeEventPublisher::publish('part_usage.rejected', [
-            'part_usage_id' => $partUsage->id,
-            'status'        => 'rejected',
-            'qty'           => (int) $partUsage->qty,
-            'part_id'       => $partUsage->part_id,
-        ], ['admin']);
+        return $old
+            ? $old . "\n" . $line
+            : $line;
+    }
 
-        return response()->json([
-            'message' => 'Request ditolak.',
-            'usage'   => $partUsage,
-        ]);
+    /*
+    |--------------------------------------------------------------------------
+    | HELPER: BUILD EVENT PAYLOAD
+    |--------------------------------------------------------------------------
+    |
+    | Payload dibuat lengkap supaya frontend/mobile bisa membaca progress
+    | tanpa perlu menebak struktur data.
+    |
+    */
+    private function buildPartUsageEventPayload(TechnicianPartUsage $partUsage, array $extra = []): array
+    {
+        $part = $partUsage->part;
+        $technician = $partUsage->technician;
+        $damageReport = $partUsage->damageReport;
+        $vehicle = $damageReport?->vehicle;
+
+        return array_merge([
+            'part_usage_id'    => (int) $partUsage->id,
+            'status'           => (string) $partUsage->status,
+            'qty'              => (int) $partUsage->qty,
+            'note'             => $partUsage->note,
+
+            'technician_id'    => $partUsage->technician_id ? (int) $partUsage->technician_id : null,
+            'damage_report_id' => $partUsage->damage_report_id ? (int) $partUsage->damage_report_id : null,
+            'part_id'          => $partUsage->part_id ? (int) $partUsage->part_id : null,
+
+            'part_name'        => $part?->name,
+            'part_sku'         => $part?->sku,
+            'part_stock'       => $part?->stock,
+
+            'technician' => $technician ? [
+                'id'       => (int) $technician->id,
+                'username' => $technician->username,
+                'role'     => $technician->role,
+            ] : null,
+
+            'part' => $part ? [
+                'id'    => (int) $part->id,
+                'name'  => $part->name,
+                'sku'   => $part->sku,
+                'stock' => $part->stock,
+            ] : null,
+
+            'damage_report' => $damageReport ? [
+                'id'          => (int) $damageReport->id,
+                'description' => $damageReport->description,
+                'created_at'  => optional($damageReport->created_at)->toISOString(),
+            ] : null,
+
+            'vehicle' => $vehicle ? [
+                'id'             => (int) $vehicle->id,
+                'plate_number'   => $vehicle->plate_number,
+                'brand'          => $vehicle->brand,
+                'model'          => $vehicle->model,
+                'equipment_name' => $vehicle->equipment_name ?? null,
+                'serial_number'  => $vehicle->serial_number ?? null,
+            ] : null,
+
+            'created_at' => optional($partUsage->created_at)->toISOString(),
+            'updated_at' => optional($partUsage->updated_at)->toISOString(),
+        ], $extra);
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | HELPER: PUBLISH NODE EVENT
+    |--------------------------------------------------------------------------
+    */
+    private function publishNodeEvent(string $event, array $payload, array $rooms): void
+    {
+        try {
+            NodeEventPublisher::publish($event, $payload, $rooms);
+        } catch (\Throwable $e) {
+            Log::warning('Gagal publish node event ' . $event, [
+                'event' => $event,
+                'error' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | HELPER: FCM KE TEKNISI
+    |--------------------------------------------------------------------------
+    |
+    | Kalau FcmService aktif, teknisi akan mendapat notifikasi mobile.
+    | Kalau FCM gagal, proses approve/reject tetap tidak terganggu.
+    |
+    */
+    private function notifyTechnicianViaFcm(
+        TechnicianPartUsage $partUsage,
+        string $title,
+        string $body,
+        string $status,
+        ?string $reason = null
+    ): void {
+        try {
+            if (!$partUsage->relationLoaded('technician')) {
+                $partUsage->load('technician:id,username,role');
+            }
+
+            $technician = $partUsage->technician;
+
+            if (!$technician) {
+                return;
+            }
+
+            $fcm = app(\App\Services\FcmService::class);
+
+            $fcm->sendToUser(
+                $technician,
+                $title,
+                $body,
+                [
+                    'type' => 'part_usage',
+                    'role' => 'technician',
+                    'status' => $status,
+                    'part_usage_id' => (string) $partUsage->id,
+                    'damage_report_id' => (string) $partUsage->damage_report_id,
+                    'part_id' => (string) $partUsage->part_id,
+                    'qty' => (string) $partUsage->qty,
+                    'reason' => (string) ($reason ?? ''),
+                ]
+            );
+        } catch (\Throwable $e) {
+            Log::warning('Gagal kirim FCM part usage ke teknisi', [
+                'part_usage_id' => $partUsage->id ?? null,
+                'status' => $status,
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
 }
